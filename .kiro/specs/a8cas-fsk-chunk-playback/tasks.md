@@ -41,39 +41,39 @@ Tasks should be completed in order. Every implementation task below starts unche
     - Technical Design: revised `design.md` using segmented whole-payload preload.
     - This `tasks.md` becomes the implementation checklist after explicit approval.
 
-- [ ] 2. Reconcile the pure FSK module with segmented payload storage
-  - [ ] 2.1 Preserve the still-valid timing/parity helpers in `lib/device/sio/fsk_plan.h`
+- [x] 2. Reconcile the pure FSK module with segmented payload storage
+  - [x] 2.1 Preserve the still-valid timing/parity helpers in `lib/device/sio/fsk_plan.h`
     - Keep `FSK_MAX_PORTION_TICKS = 32767`.
     - Keep `FSK_RMT_TICKS_PER_A8CAS_UNIT = 100`.
     - Keep `fsk_ticks_for_value(uint16_t)` as exact `value * 100` tick scaling.
     - Keep `fsk_decode_le16`, `fsk_level_for_index`, `fsk_next_portion`, and `fsk_value_count`.
     - Keep ISR-used helpers allocation-free, logging-free, I/O-free, and `static inline` so production ISR code can use the same rules exercised by host tests.
     - _Requirements: 2.1, 2.3-2.5, 4.1, 4.2, 4.6, 6.2, 6.4_
-  - [ ] 2.2 Add block-table logical-byte accessors
+  - [x] 2.2 Add block-table logical-byte accessors
     - Implement `fsk_block_byte(...)`.
     - Implement `fsk_block_le16(...)`.
     - Correctly decode a 2-byte little-endian FSK value even when its bytes straddle two preload blocks.
     - Keep accessors pure, allocation-free, I/O-free, and safe for ISR inlining.
     - _Requirements: 2.1, 6.2, 6.4, 10.1_
-  - [ ] 2.3 Convert `FskChunkView` to logical block-table addressing
+  - [x] 2.3 Convert `FskChunkView` to logical block-table addressing
     - Store block table pointer, block size, clamped logical payload length, value index, logical byte position, remaining ticks, and level state.
     - Ensure `fsk_view_step` advances only complete 2-byte values.
     - Ensure zero-duration values consume their original signal index without emitting a portion.
     - Ensure no logical read occurs at or beyond `data_len_available`.
     - _Requirements: 2.3, 2.5, 4.6, 6.2-6.4_
-  - [ ] 2.4 Add the host-testable bounded preload helper
+  - [x] 2.4 Add the host-testable bounded preload helper
     - Implement `fsk_preload_into_blocks(...)` with an injected reader callback.
     - Limit each requested read to the caller-provided `read_max`.
     - Accumulate positive partial/short reads until the requested clamped payload is complete.
     - Treat reader return `0` before completion as preload failure/EOF and return the number of bytes actually loaded.
     - Never write outside the allocated blocks or beyond `want`.
     - _Requirements: 6.2, 6.3, 6.5, 10.1-10.4_
-  - [ ] 2.5 Compile the pure module independently on the host
+  - [x] 2.5 Compile the pure module independently on the host
     - Confirm it has no FujiNet hardware, GPIO, RMT, filesystem, ESP heap-capability, or global-state dependency.
     - _Requirements: 8.1_
 
 - [ ] 3. Expand automated tests for the revised pure model and preload strategy
-  - [ ] 3.1 Preserve the existing A8CAS timing/parity example tests
+  - [x] 3.1 Preserve the existing A8CAS timing/parity example tests
     - Keep Requirement 2.7 worked example.
     - Keep zero-length, odd-tail, zero-duration parity, and representative values `1`, `256`, `6818`, `40000`, and `65535`.
     - Verify `6818 -> 681800 ticks -> 21 portions` as generic split arithmetic only, not as a title-specific signature.
@@ -90,26 +90,26 @@ Tasks should be completed in order. Every implementation task below starts unche
     - Property 8: FSK processing carries no baud-change action.
     - Property 9: zero-length chunk is IRG-only.
     - _Requirements: 1.4, 2.1-2.8, 4.1, 4.2, 4.6, 5.1, 6.1-6.6, 8.3, 8.4_
-  - [ ] 3.3 Add segmented-block addressing tests
+  - [x] 3.3 Add segmented-block addressing tests
     - Exercise block sizes that force values to straddle block boundaries.
     - Compare every logical byte/value against an equivalent contiguous payload.
     - Exercise block size `1`, representative small sizes, and production size `512`.
     - _Requirements: 2.1, 6.2, 6.4, 10.1_
-  - [ ] 3.4 Add preload-reader tests
+  - [x] 3.4 Add preload-reader tests
     - Verify no single reader request exceeds `512` bytes.
     - Verify repeated positive short reads are accumulated correctly.
     - Verify exact 512-byte, multi-block, and maximum 65535-byte payload cases.
     - Verify EOF/read failure before completion returns a short total and never writes out of bounds.
     - Verify odd final byte handling remains separate from read failure.
     - _Requirements: 6.2-6.6, 10.1-10.4_
-  - [ ] 3.5 Add a synthetic pure raw-FSK CAS path fixture
+  - [x] 3.5 Add a synthetic pure raw-FSK CAS path fixture
     - Model `FUJI` followed only by one or more `fsk ` chunks with no `baud` or `data` chunks.
     - Keep fixtures generated in source; do not add real-world `.cas` files.
     - _Requirements: 1.5, 1.8, 9.2, 9.5_
-  - [ ] 3.6 Add a synthetic interleaved `baud` / `data` / `fsk ` fixture
+  - [x] 3.6 Add a synthetic interleaved `baud` / `data` / `fsk ` fixture
     - Verify FSK is non-terminating in the chunk walk and that a following `data` record uses the pre-FSK Active_Baud_Rate unless an intervening `baud` chunk changes it.
     - _Requirements: 5.1-5.3, 9.1, 9.3, 9.4_
-  - [ ] 3.7 Register/update `fsk_plan_tests` in `tests/CMakeLists.txt`
+  - [x] 3.7 Register/update `fsk_plan_tests` in `tests/CMakeLists.txt`
     - Keep the standalone doctest executable host-buildable and independent of ESP-only code.
     - _Requirements: 8.1_
 
@@ -261,7 +261,7 @@ Tasks should be completed in order. Every implementation task below starts unche
     - _Requirements: 7.2-7.6_
 
 - [ ] 10. Run automated, build, and resource verification
-  - [ ] 10.1 Run `fsk_plan_tests`
+  - [x] 10.1 Run `fsk_plan_tests`
     - Confirm all example, block-table, preload-reader, generated-property, odd/truncated, and max-value tests pass.
     - _Requirements: 2.1-2.8, 4.6, 6.1-6.6, 10.1-10.4_
   - [ ] 10.2 Build and exercise fujinet-pc
