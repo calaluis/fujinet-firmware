@@ -614,14 +614,41 @@ size_t sioCassette::send_FUJI_tape_block(size_t offset)
         // looking for a data header while handling baud changes along the way
         Debug_printf("Offset: %u\r\n", offset);
         fnio::fseek(_file, offset, SEEK_SET);
-        fnio::fread(atari_sector_buffer, 1, sizeof(struct tape_FUJI_hdr), _file);
+        size_t hdr_read =
+            fnio::fread(atari_sector_buffer, 1, sizeof(struct tape_FUJI_hdr), _file);
+        // Task 8.3 — truncated-header protection: a complete 8-byte A8CAS chunk
+        // header must be present before any header field is used. Fewer than 8
+        // bytes remaining is end-of-tape (Req 6.1, 6.6, 8.4), and prevents using
+        // stale buffer bytes as chunk_type/length/aux.
+        if (hdr_read < sizeof(struct tape_FUJI_hdr))
+            return 0; // EOT: no complete subsequent chunk
+
         len = hdr->chunk_length;
+
+        // Task 8 — structural body-fit check. A complete 8-byte header does NOT
+        // guarantee the declared body fits in the remaining file. Compute the
+        // bytes available after the header using SUBTRACTION (offset < filesize
+        // from the loop condition, and hdr_read == header_size verified above,
+        // so this cannot underflow), then compare to the declared length. A
+        // declared body that would pass EOF means there is no complete chunk
+        // here (Req 6.6): data/baud/unknown terminate at EOT (return 0) before
+        // touching baud, block state, the IRG, or the data transmit loop.
+        // NOTE: "fsk " is intentionally EXEMPT — the approved Task 7 policy
+        // (design Malformed Chunk Policy / Property 7) clamps a structurally
+        // truncated FSK chunk to its present bytes, reproduces the complete u16
+        // prefix, and returns 0; play_fsk_chunk's return stays authoritative.
+        const size_t header_size = sizeof(struct tape_FUJI_hdr);
+        const size_t bytes_after_header = filesize - offset - header_size;
+        const bool body_complete =
+            static_cast<size_t>(hdr->chunk_length) <= bytes_after_header;
 
         if (p[0] == 'd' && //is a data header?
             p[1] == 'a' &&
             p[2] == 't' &&
             p[3] == 'a')
         {
+            if (!body_complete)
+                return 0; // truncated data body -> EOT before any transmission
             block++;
             break;
         }
@@ -630,11 +657,40 @@ size_t sioCassette::send_FUJI_tape_block(size_t offset)
                  p[2] == 'u' &&
                  p[3] == 'd')
         {
+            if (!body_complete)
+                return 0; // truncated baud body -> EOT before changing baud
             if (tape_flags.turbo) //ignore baud hdr
                 continue;
             baud = hdr->irg_length;
             SYSTEM_BUS.setBaudrate(baud);
         }
+        else if (p[0] == 'f' && //is a raw FSK header? ('f','s','k',' ')
+                 p[1] == 's' &&
+                 p[2] == 'k' &&
+                 p[3] == ' ')
+        {
+            // Task 8.1/8.2 — generic raw-FSK chunk, detected solely by the
+            // 4-byte chunk type. Delegate the WHOLE chunk (IRG + signal) to the
+            // approved cross-platform play_fsk_chunk, passing the chunk START
+            // offset, the header length, and the header aux as the IRG (ms). We
+            // do NOT reinterpret the FSK payload, read duration values, or
+            // recompute the next offset here — play_fsk_chunk's return is
+            // authoritative. FSK is non-terminating: on a normal advance we keep
+            // walking in ascending file order (baud unchanged).
+            size_t next = play_fsk_chunk(offset, hdr->chunk_length,
+                                         hdr->irg_length);
+            if (next == 0)
+                return 0; // EOT / no safe continuation (Req 6.6)
+            if (next == offset)
+                return offset; // motor-abort retry from this chunk (Req 3.3/3.4)
+            offset = next; // structural advance past the FSK chunk; keep walking
+            continue;
+        }
+        // Unknown / non-FSK chunk (Task 8.4): skip by 8 + length only when the
+        // declared body is structurally complete; otherwise there is no complete
+        // subsequent chunk -> EOT (Req 6.6), never advance an offset past EOF.
+        if (!body_complete)
+            return 0;
         offset += sizeof(struct tape_FUJI_hdr) + len;
     }
 

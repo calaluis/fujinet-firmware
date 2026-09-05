@@ -228,21 +228,21 @@ Tasks should be completed in order. Every implementation task below starts unche
     - Advance well-formed chunks correctly and terminate at EOT for truncated/overrun cases.
     - _Requirements: 8.1-8.4_
 
-- [ ] 8. Integrate `fsk ` handling into the normal FUJI chunk walker
-  - [ ] 8.1 Detect exactly `'f','s','k',' '` before the unknown-chunk catch-all
+- [x] 8. Integrate `fsk ` handling into the normal FUJI chunk walker
+  - [x] 8.1 Detect exactly `'f','s','k',' '` before the unknown-chunk catch-all
     - Detection is solely by the 4-byte chunk type.
     - Do not inspect filenames, games, countries, source signatures, known durations, or corpus identities.
     - _Requirements: 1.1, 1.7, 9.5, 9.8_
-  - [ ] 8.2 Treat FSK as a non-terminating chunk
+  - [x] 8.2 Treat FSK as a non-terminating chunk
     - After successful FSK handling, continue walking in ascending file order.
     - Preserve the active baud until a real `baud` chunk changes it.
     - Support both interleaved and pure `FUJI + fsk + ... + fsk` images to EOT.
     - _Requirements: 1.2, 1.3, 1.5, 1.8, 5.1-5.3, 9.1-9.3_
-  - [ ] 8.3 Add/retain truncated-header protection
+  - [x] 8.3 Add/retain truncated-header protection
     - Validate the number of header bytes actually read before using header fields.
     - Terminate at EOT when fewer than 8 header bytes remain.
     - _Requirements: 6.1, 8.4_
-  - [ ] 8.4 Preserve unknown-chunk behavior
+  - [x] 8.4 Preserve unknown-chunk behavior
     - Continue to skip unknown chunk types by `8 + chunk_length` where structurally valid.
     - Preserve Active_Baud_Rate and normal file-order traversal.
     - _Requirements: 1.6, 9.4_
