@@ -5,6 +5,7 @@
 
 #ifdef ESP_PLATFORM
 #include <driver/rmt_types.h>
+#include <esp_heap_caps.h> // ESP-only: force ISR-visible FSK payload into internal 8-bit DRAM
 #endif
 
 #include "bus.h"
@@ -192,6 +193,75 @@ private:
     rmt_symbol_word_t _t2k_sync_syms[16];
     size_t _t2k_sync_count = 0;
     size_t _t2k_pilot_pending = 0; // pilot symbols to generate before sync+data
+#endif
+
+    // ----------------------------------------------------------------------
+    // A8CAS raw FSK ("fsk ") chunk playback (segmented whole-payload preload)
+    // ----------------------------------------------------------------------
+
+    // FSK chunk playback (A8CAS "fsk " chunks) — cross-platform entry point.
+    // PRELOADS the whole clamped payload into a small block table via a bounded
+    // read-loop (before any emission), honors the IRG, reproduces the raw FSK
+    // signal via the RMT stateful simple encoder fed from that IMMUTABLE resident
+    // block table (ESP), or safely skips (PC), and returns the next read offset.
+    // Never changes the active baud. Holds NO full-waveform buffer; the payload IS
+    // resident (as a block table) but there is no in-flight mutation and no file
+    // I/O during emission.
+    size_t play_fsk_chunk(size_t offset, uint16_t chunk_length, uint16_t irg_ms);
+
+#ifdef ESP_PLATFORM
+    // Segmented preload block size. Small (kind to a fragmented no-PSRAM heap)
+    // and, being <= the TNFS per-read limit, fillable by a single fnio::fread.
+    // A8CAS caps the payload at 65535 bytes, so at 512 bytes/block the pointer
+    // table is <= 128 entries. A payload that fits one block uses the contiguous
+    // fast path.
+    static constexpr size_t FSK_PRELOAD_BLOCK_BYTES = 512;
+
+    // Conservative maximum requested in one preload read. Current FujiNet TNFS
+    // allows at most 525 bytes; 512 stays below that limit and matches the block
+    // size. Positive short reads are accumulated until the clamped payload is
+    // complete.
+    static constexpr size_t FSK_PRELOAD_READ_MAX = 512;
+
+    // Raw FSK signal helpers built on the ESP RMT peripheral (same PIN_UART2_TX
+    // and detach/reattach approach as Turbo 2000, and the same stateful simple
+    // encoder pattern as t2k_encode_cb / rmt_new_simple_encoder).
+    bool fsk_signal_begin();   // alloc RMT channel + simple encoder (callback=fsk_encode_cb, arg=this), detach UART TX; false on failure
+    void fsk_signal_emit();    // ONE rmt_transmit using the immutable pointer table as transaction payload; then wait-done
+    void fsk_signal_end();     // idempotent: teardown RMT + encoder, reattach UART TX
+    void fsk_free_blocks();    // free every preloaded block + the pointer table; idempotent, safe after partial preload
+
+    // The stateful RMT simple-encoder callback (same 7-arg signature as
+    // t2k_encode_cb). Generates rmt_symbol_word_t on demand from the IMMUTABLE
+    // resident block table plus the O(1) encoder cursor below. NO file I/O, NO
+    // heap allocation. The simple encoder is configured with min_chunk_size = 1;
+    // when work remains the callback produces at least one symbol, otherwise it
+    // sets *done. It never returns 0 to wait for source data.
+    static size_t IRAM_ATTR fsk_encode_cb(const void *data, size_t data_size,
+                                          size_t symbols_written, size_t symbols_free,
+                                          rmt_symbol_word_t *symbols, bool *done, void *arg);
+
+    void       *_fsk_rmt_channel = nullptr;
+    void       *_fsk_rmt_encoder = nullptr;
+    bool        _fsk_signal_active = false;
+
+    // --- Preloaded payload as a block table (fully resident BEFORE rmt_transmit,
+    //     IMMUTABLE during the transaction). A payload that fits one block is a
+    //     single-element table (the contiguous fast path). Freed only after
+    //     rmt_tx_wait_all_done, in the single cleanup path. ---
+    uint8_t  **_fsk_blocks          = nullptr; // pointer table: _fsk_block_count entries
+    size_t     _fsk_block_size      = 0;       // bytes per block (final block may be partly used)
+    size_t     _fsk_block_count     = 0;       // number of blocks allocated
+    size_t     _fsk_payload_len     = 0;       // total clamped logical payload bytes (0..65535)
+
+    // --- O(1) ISR-only encoder cursor over the immutable block table
+    //     (set before rmt_transmit; advanced ONLY by fsk_encode_cb in the ISR;
+    //     no task mutates it during the transaction) ---
+    size_t   _fsk_value_count       = 0;       // floor(_fsk_payload_len / 2); done when index reaches this
+    size_t   _fsk_value_index       = 0;       // current original FSK value index (for parity)
+    size_t   _fsk_payload_pos       = 0;       // logical payload byte position consumed by the encoder (== value_index*2)
+    uint32_t _fsk_remaining_ticks   = 0;       // ticks left for the value being split (15-bit carry)
+    bool     _fsk_level_high        = false;   // logical level of the value being split (index parity)
 #endif
 };
 

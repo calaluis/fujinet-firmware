@@ -113,8 +113,8 @@ Tasks should be completed in order. Every implementation task below starts unche
     - Keep the standalone doctest executable host-buildable and independent of ESP-only code.
     - _Requirements: 8.1_
 
-- [ ] 4. Refactor `sioCassette` declarations for the approved payload model
-  - [ ] 4.1 Update `lib/device/sio/cassette.h`
+- [x] 4. Refactor `sioCassette` declarations for the approved payload model
+  - [x] 4.1 Update `lib/device/sio/cassette.h`
     - Keep cross-platform `play_fsk_chunk(size_t offset, uint16_t chunk_length, uint16_t irg_ms)`.
     - Under `ESP_PLATFORM`, keep/add `fsk_signal_begin`, `fsk_signal_emit`, `fsk_signal_end`, `fsk_free_blocks`, and `IRAM_ATTR fsk_encode_cb`.
     - Remove obsolete single-buffer state such as `_fsk_buf` and any streaming ring/ready-index state.
@@ -122,7 +122,7 @@ Tasks should be completed in order. Every implementation task below starts unche
     - Keep only O(1) ISR cursor state: value count, value index, logical payload position, remaining ticks, current level.
     - Keep all ESP-specific members behind `#ifdef ESP_PLATFORM` so fujinet-pc remains clean.
     - _Requirements: 4.1-4.6, 5.1-5.5, 8.1, 10.1-10.4_
-  - [ ] 4.2 Add/verify required ESP-only includes and constants
+  - [x] 4.2 Add/verify required ESP-only includes and constants
     - Include `esp_heap_caps.h` only on ESP builds.
     - Define `FSK_PRELOAD_BLOCK_BYTES = 512`.
     - Define `FSK_PRELOAD_READ_MAX = 512` so every production read stays below the current TNFS 525-byte maximum.
