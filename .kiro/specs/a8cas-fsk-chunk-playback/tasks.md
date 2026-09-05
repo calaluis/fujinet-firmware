@@ -269,7 +269,7 @@ Tasks should be completed in order. Every implementation task below starts unche
     - Exercise synthetic interleaved and pure raw-FSK images where practical.
     - Confirm deterministic IRG handling and safe EOT behavior.
     - _Requirements: 8.1-8.4_
-  - [ ] 10.3 Build classic ESP32 Atari FujiNet
+  - [x] 10.3 Build classic ESP32 Atari FujiNet
     - Verify `IRAM_ATTR` callback, 1 MHz RMT configuration, `min_chunk_size = 1`, internal-RAM heap-capability calls, pointer-table payload, pin routing, and cleanup all compile cleanly.
     - Watch for IRAM/cache-safety and type/signature warnings.
     - _Requirements: 4.1-4.5, 7.1, 10.4_
