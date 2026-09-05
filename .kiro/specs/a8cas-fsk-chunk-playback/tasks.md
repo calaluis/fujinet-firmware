@@ -128,7 +128,7 @@ Tasks should be completed in order. Every implementation task below starts unche
     - Define `FSK_PRELOAD_READ_MAX = 512` so every production read stays below the current TNFS 525-byte maximum.
     - _Requirements: 8.1, 10.1-10.4_
 
-- [ ] 5. Implement segmented whole-payload preload in internal RAM
+- [x] 5. Implement segmented whole-payload preload in internal RAM
   - [x] 5.1 Compute structural bounds before allocation or file reads
     - Require a complete 8-byte chunk header.
     - Compute `data_avail = min(declared_len, bytes_remaining_after_header)`.
@@ -151,7 +151,7 @@ Tasks should be completed in order. Every implementation task below starts unche
     - Ensure every individual read request is `<= FSK_PRELOAD_READ_MAX` (512 bytes).
     - Accumulate positive partial reads until the entire clamped payload is resident.
     - _Requirements: 6.2, 6.3, 6.5, 10.1-10.4_
-  - [ ] 5.5 Handle runtime preload failure without partial waveform emission
+  - [x] 5.5 Handle runtime preload failure without partial waveform emission
     - If `fseek` fails or the reader returns 0 before all `data_avail` bytes are loaded, do not emit a partial waveform from that runtime-failed preload.
     - Free all blocks/table, preserve UART and baud state, and follow the approved safe skip/EOT behavior.
     - Keep this distinct from a structurally truncated CAS whose entire clamped prefix was loaded successfully; that fully-present prefix may be reproduced per the design.
@@ -200,28 +200,28 @@ Tasks should be completed in order. Every implementation task below starts unche
     - Clear handles/state and preserve the UART baud divisor.
     - _Requirements: 4.3, 4.5, 5.1, 5.3-5.5_
 
-- [ ] 7. Implement revised cross-platform `play_fsk_chunk`
-  - [ ] 7.1 Preserve the single cleanup path
+- [x] 7. Implement revised cross-platform `play_fsk_chunk`
+  - [x] 7.1 Preserve the single cleanup path
     - Route success, motor abort, allocation failure, seek/read failure, RMT setup failure, and transmit completion through one deterministic cleanup path.
     - Ensure RMT teardown occurs before freeing any ISR-visible block memory.
     - _Requirements: 4.5, 5.4, 5.5, 6.6, 10.3_
-  - [ ] 7.2 Honor the FSK Inter-Record Gap
+  - [x] 7.2 Honor the FSK Inter-Record Gap
     - Use the chunk `aux` value as an unsigned millisecond IRG.
     - Preserve existing motor-line behavior.
     - If pulldown is present, motor becomes de-asserted, and more than 1000 ms remains, abort safely and return `starting_offset` for retry.
     - Restore LED state on abort and completion.
     - _Requirements: 2.2, 2.8, 3.1-3.4_
-  - [ ] 7.3 Emit ESP raw signal only after a complete successful preload
+  - [x] 7.3 Emit ESP raw signal only after a complete successful preload
     - Initialize the ISR cursor only after the payload is fully resident and `fsk_signal_begin` succeeds.
     - Call `fsk_signal_emit` only when at least one complete FSK value exists.
     - For zero values, honor IRG and emit no signal.
     - Never perform file I/O between waveform transitions.
     - _Requirements: 2.8, 4.1-4.6, 10.4_
-  - [ ] 7.4 Preserve Active_Baud_Rate on all FSK paths
+  - [x] 7.4 Preserve Active_Baud_Rate on all FSK paths
     - Never call `SYSTEM_BUS.setBaudrate` from FSK processing.
     - Verify success, motor abort, allocation failure, preload failure, RMT setup failure, and cleanup all leave the active baud unchanged.
     - _Requirements: 5.1-5.5_
-  - [ ] 7.5 Implement deterministic PC-build behavior without payload preload
+  - [x] 7.5 Implement deterministic PC-build behavior without payload preload
     - Use local `data_avail` / bounds arithmetic; do not reference ESP-only `_fsk_payload_len` or heap/RMT state.
     - Honor IRG through `SYSTEM_BUS.bus_idle` using existing NetSIO/SerialSIO step sizing.
     - Do not invoke RMT, GPIO, ESP heap APIs, or raw signal generation.

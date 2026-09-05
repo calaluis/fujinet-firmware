@@ -2592,4 +2592,162 @@ void sioCassette::fsk_signal_end()
 
 #endif // ESP_PLATFORM
 
+// =====================================================================
+// A8CAS raw FSK ("fsk ") chunk playback — Task 7: cross-platform
+// play_fsk_chunk orchestration.
+//
+// Owns ONE "fsk " chunk end to end by composing the already-approved pieces:
+//   1. structural bounds        (Task 5.1 fsk_compute_bounds)
+//   2. segmented preload         (Task 5.2-5.6, ESP only)
+//   3. IRG honoring              (mirrors the data-record gap loop)
+//   4. ESP RMT begin/emit/end    (Task 6)
+//   5. single idempotent cleanup (fsk_signal_end + fsk_free_blocks)
+//   6. safe next-offset / safe failure behavior
+//
+// It does NOT recognize "fsk " in the walker, does NOT scan for following
+// chunks, does NOT touch baud, and does NOT reimplement preload/waveform logic.
+// Return semantics (approved design "Error Handling" table + Malformed Chunk
+// Policy):
+//   * truncated header (< 8 bytes remain)            -> 0 (EOT)
+//   * structurally truncated / overrun declared len  -> reproduce present
+//                                                        prefix, then 0 (EOT)
+//   * well-formed (incl. odd length, zero length)     -> offset + 8 + chunk_length
+//   * motor-line abort during IRG                     -> starting_offset (retry)
+//   * preload / begin failure (well-formed)           -> cleanup, advance
+//   * preload / begin failure (overrun)               -> cleanup, 0 (EOT)
+// The returned offset is based on STRUCTURAL boundaries, never on how many bytes
+// happened to preload at runtime. Baud/UART are never changed here.
+// =====================================================================
+size_t sioCassette::play_fsk_chunk(size_t offset, uint16_t chunk_length,
+                                   uint16_t irg_ms)
+{
+    const size_t starting_offset = offset;
+
+    // ---- 1. Structural bounds (cross-platform, pure) ----
+    size_t data_avail = 0;
+    size_t value_count = 0;
+    bool structurally_truncated = false;
+    if (!fsk_compute_bounds(filesize, offset, chunk_length, data_avail,
+                            value_count, structurally_truncated))
+    {
+        // Fewer than 8 header bytes remain (or impossible offset): end-of-tape.
+        // No read past EOF, no allocation, no signal. (Req 6.1, 8.4)
+        return 0;
+    }
+
+    // Structural next-offset: a well-formed chunk advances past its declared
+    // extent; a structurally truncated/overrun chunk terminates at EOT (0),
+    // because offset + 8 + chunk_length would point past the image. This is a
+    // STRUCTURAL decision independent of any runtime preload outcome.
+    const size_t next_offset =
+        structurally_truncated ? 0 : (offset + 8 + (size_t)chunk_length);
+
+    // result is assigned on entry to each terminal condition; every path funnels
+    // through the single `done:` cleanup label below.
+    size_t result = next_offset;
+
+#ifdef ESP_PLATFORM
+    // ---- 2. Segmented whole-payload preload (BEFORE the IRG, BEFORE any RMT) ----
+    // TNFS/file latency is allowed here, before waveform start; once RMT begins
+    // there is no file I/O and no source starvation. On failure we emit no
+    // partial waveform and fall through to the IRG + cleanup with the structural
+    // next-offset (or EOT for the overrun case). fsk_preload_payload frees any
+    // partial allocation itself on failure; a data_avail of 0 loads nothing.
+    const size_t payload_start = offset + 8;
+    bool preload_ok =
+        fsk_preload_payload(_file, payload_start, data_avail,
+                            FSK_PRELOAD_BLOCK_BYTES, FSK_PRELOAD_READ_MAX,
+                            _fsk_blocks, _fsk_block_size, _fsk_block_count,
+                            _fsk_payload_len, _fsk_value_count);
+    if (!preload_ok)
+    {
+        // Runtime preload failure (seek/read/alloc): no waveform, blocks already
+        // freed by the helper. Still honor the IRG and take the safe structural
+        // result. Distinct from structural truncation (which loads fully).
+        Debug_printf("FSK: preload failed at offset %u, skipping emission\r\n",
+                     (unsigned)offset);
+    }
+
+    // ---- 3. Inter-Record Gap (mirrors the data-record gap loop exactly) ----
+    {
+        uint32_t gap = irg_ms;
+        fnLedManager.set(eLed::LED_BUS, true);
+        while (gap)
+        {
+            gap--;
+            fnSystem.delay_microseconds(999); // shave a usec for the MOTOR check
+            if (has_pulldown() && !motor_line() && gap > 1000)
+            {
+                // Motor de-asserted mid-gap: abort for retry from the chunk
+                // start. Cleanup (below) frees any preloaded blocks; baud/UART
+                // untouched. (Req 3.3, 3.4, 5.4)
+                fnLedManager.set(eLed::LED_BUS, false);
+                result = starting_offset;
+                goto done;
+            }
+        }
+        fnLedManager.set(eLed::LED_BUS, false);
+    }
+
+    // ---- 4. ESP raw signal: begin -> emit -> end (only with real work) ----
+    // Emit only when the preload succeeded AND at least one complete value
+    // exists. A zero-value payload honors the IRG and emits nothing.
+    if (preload_ok && _fsk_value_count > 0)
+    {
+        if (fsk_signal_begin())
+        {
+            // Cursor was reset by begin(); the payload is resident + immutable.
+            fsk_signal_emit();   // ONE continuous rmt_transmit + wait-all-done
+            fsk_signal_end();    // teardown + UART reattach (after wait-done)
+        }
+        else
+        {
+            // begin() failed and already undid any partial RMT setup and
+            // reattached UART. Skip emission; blocks freed in cleanup. Advance
+            // (or EOT for overrun) with subsequent data playback uncorrupted.
+            Debug_printf("FSK: signal begin failed at offset %u\r\n",
+                         (unsigned)offset);
+        }
+    }
+
+done:
+    // ---- 5. Single idempotent cleanup path ----
+    // fsk_signal_end() is idempotent (no-op if RMT never started); it reattaches
+    // UART TX and waits for any in-flight transmit before we free ISR-visible
+    // memory. Blocks are freed AFTER wait-done, never inside fsk_signal_end.
+    fsk_signal_end();
+    fsk_free_blocks();
+    return result;
+
+#else  // ---- PC build: structural bounds + IRG + safe skip, no raw signal ----
+    (void)data_avail;
+    (void)value_count;
+
+    // Honor the IRG deterministically via bus_idle (NetSIO/SerialSIO stepping),
+    // mirroring the data path. No payload preload, no RMT, no ESP-only state.
+    uint32_t gap = irg_ms;
+    fnLedManager.set(eLed::LED_BUS, true);
+    while (gap)
+    {
+        int step;
+        if (SYSTEM_BUS.isBoIP())
+            step = gap > 1000 ? 1000 : (int)gap; // 1000 ms step (NetSIO)
+        else
+            step = gap > 20 ? 20 : (int)gap;     // 20 ms step (SerialSIO)
+        gap -= step;
+        SYSTEM_BUS.bus_idle(step);
+        if (has_pulldown() && !motor_line() && gap > 1000)
+        {
+            fnLedManager.set(eLed::LED_BUS, false);
+            return starting_offset; // motor abort -> retry from chunk start
+        }
+    }
+    fnLedManager.set(eLed::LED_BUS, false);
+
+    // No raw signal on the PC build; advance by structural boundary (or EOT for
+    // the overrun/truncated case). No ESP-only members referenced.
+    return result;
+#endif
+}
+
 #endif /* BUILD_ATARI */
