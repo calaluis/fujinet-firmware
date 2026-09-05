@@ -247,16 +247,16 @@ Tasks should be completed in order. Every implementation task below starts unche
     - Preserve Active_Baud_Rate and normal file-order traversal.
     - _Requirements: 1.6, 9.4_
 
-- [ ] 9. Verify no regression in existing cassette paths
-  - [ ] 9.1 Confirm dispatcher behavior is unchanged
+- [x] 9. Verify no regression in existing cassette paths
+  - [x] 9.1 Confirm dispatcher behavior is unchanged
     - Turbo 2000 continues to use `send_turbo2000_tape_block`.
     - QROS continues to use `send_QROS_tape_block` and continues skipping `fsk ` chunks.
     - Only normal FUJI playback enters the new raw-FSK path.
     - _Requirements: 7.2-7.6_
-  - [ ] 9.2 Verify standard `baud`/`data`-only playback remains byte-for-byte equivalent where practical
+  - [x] 9.2 Verify standard `baud`/`data`-only playback remains byte-for-byte equivalent where practical
     - Confirm no FSK setup/allocation runs when no `fsk ` chunk is present.
     - _Requirements: 7.1_
-  - [ ] 9.3 Verify Turbo 2000 and QROS detection outcomes remain unchanged
+  - [x] 9.3 Verify Turbo 2000 and QROS detection outcomes remain unchanged
     - Do not modify detection unless required for compilation; if touched, prove equivalent outcomes.
     - _Requirements: 7.2-7.6_
 
