@@ -162,8 +162,8 @@ Tasks should be completed in order. Every implementation task below starts unche
     - Null/reset all payload state after cleanup.
     - _Requirements: 4.5, 5.4, 5.5, 10.3_
 
-- [ ] 6. Implement the revised ESP RMT encoder and lifecycle
-  - [ ] 6.1 Implement `fsk_encode_cb` over the immutable block table
+- [x] 6. Implement the revised ESP RMT encoder and lifecycle
+  - [x] 6.1 Implement `fsk_encode_cb` over the immutable block table
     - Run as `IRAM_ATTR` in ISR context.
     - Perform no file I/O, logging, allocation, blocking APIs, or flash-dependent work.
     - Read FSK values only through the block-table accessors.
@@ -171,29 +171,29 @@ Tasks should be completed in order. Every implementation task below starts unche
     - Split each `value * 100` tick duration into same-level portions `<=32767` ticks.
     - Use only O(1) ISR cursor state.
     - _Requirements: 2.1, 2.4, 2.5, 4.1, 4.2, 4.6_
-  - [ ] 6.2 Configure the simple encoder with explicit `min_chunk_size = 1`
+  - [x] 6.2 Configure the simple encoder with explicit `min_chunk_size = 1`
     - Whenever waveform work remains and at least one symbol slot is available, produce at least one symbol.
     - Never return `0` to wait for source data.
     - Set `*done = false` at the start of each callback invocation and `true` only when the waveform is fully complete.
     - _Requirements: 4.1, 4.5_
-  - [ ] 6.3 Implement `fsk_signal_begin`
+  - [x] 6.3 Implement `fsk_signal_begin`
     - Flush pending UART output before taking the TX pin.
     - Use `PIN_UART2_TX` and the existing Turbo 2000/QROS detach-routing precedent.
     - Configure RMT TX at 1 MHz with `RMT_CLK_SRC_DEFAULT`.
     - Create/enable the simple encoder/channel and fully undo partial setup on failure.
     - Return clean failure for `GPIO_NUM_NC` or any RMT setup error.
     - _Requirements: 4.1, 4.3, 4.5, 5.3-5.5_
-  - [ ] 6.4 Implement `fsk_signal_emit` as exactly one RMT transaction
+  - [x] 6.4 Implement `fsk_signal_emit` as exactly one RMT transaction
     - Pass the **contiguous pointer table** `_fsk_blocks` as the transaction payload, not `_fsk_blocks[0]` as though the entire payload were contiguous.
     - Use `data_size = _fsk_block_count * sizeof(uint8_t *)` (or the final design-equivalent transaction metadata) while the callback derives waveform completion from `_fsk_value_count` / `_fsk_payload_len`.
     - Keep the pointer table and every block immutable until `rmt_tx_wait_all_done` completes.
     - Do not use repeated transmit batches and do not perform any file I/O during the transaction.
     - _Requirements: 4.1, 4.2, 10.4_
-  - [ ] 6.5 Add a guard/test against the invalid contiguous-payload regression
+  - [x] 6.5 Add a guard/test against the invalid contiguous-payload regression
     - Ensure implementation never calls `rmt_transmit(..., _fsk_blocks[0], _fsk_payload_len, ...)` for a multi-block payload.
     - Document why the RMT transaction payload and the logical FSK payload are different under segmented storage.
     - _Requirements: 4.1, 10.4_
-  - [ ] 6.6 Implement idempotent `fsk_signal_end`
+  - [x] 6.6 Implement idempotent `fsk_signal_end`
     - Wait for any in-flight transaction before freeing payload memory.
     - Disable/delete the RMT channel and encoder.
     - Reattach UART2 TX routing exactly once.
