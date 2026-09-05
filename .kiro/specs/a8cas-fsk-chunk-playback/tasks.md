@@ -129,23 +129,23 @@ Tasks should be completed in order. Every implementation task below starts unche
     - _Requirements: 8.1, 10.1-10.4_
 
 - [ ] 5. Implement segmented whole-payload preload in internal RAM
-  - [ ] 5.1 Compute structural bounds before allocation or file reads
+  - [x] 5.1 Compute structural bounds before allocation or file reads
     - Require a complete 8-byte chunk header.
     - Compute `data_avail = min(declared_len, bytes_remaining_after_header)`.
     - Distinguish structural file truncation/overrun from runtime preload read failure.
     - Compute `value_count = data_avail / 2` and ignore only the trailing odd byte under Requirement 6.4.
     - _Requirements: 1.2-1.4, 2.3, 6.1-6.6, 10.1_
-  - [ ] 5.2 Allocate the pointer table in internal 8-bit DRAM
+  - [x] 5.2 Allocate the pointer table in internal 8-bit DRAM
     - Use `heap_caps_calloc(..., MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)` on ESP.
     - Allocate at most `ceil(65535/512) = 128` entries.
     - Treat failure as genuine platform resource exhaustion, not as an artificial size cap.
     - _Requirements: 4.5, 5.5, 10.1-10.3_
-  - [ ] 5.3 Allocate each payload block in internal 8-bit DRAM
+  - [x] 5.3 Allocate each payload block in internal 8-bit DRAM
     - Use `heap_caps_malloc(512, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)`.
     - Do not depend on PSRAM for memory read by the RMT ISR callback.
     - Free every already-allocated block if a later block allocation fails.
     - _Requirements: 4.5, 10.1-10.3_
-  - [ ] 5.4 Fill blocks through the shared preload helper
+  - [x] 5.4 Fill blocks through the shared preload helper
     - Seek to the FSK payload start and check `fseek` failure.
     - Use a production adapter around `fnio::fread`.
     - Ensure every individual read request is `<= FSK_PRELOAD_READ_MAX` (512 bytes).
@@ -156,7 +156,7 @@ Tasks should be completed in order. Every implementation task below starts unche
     - Free all blocks/table, preserve UART and baud state, and follow the approved safe skip/EOT behavior.
     - Keep this distinct from a structurally truncated CAS whose entire clamped prefix was loaded successfully; that fully-present prefix may be reproduced per the design.
     - _Requirements: 4.5, 5.4, 5.5, 6.3, 6.5, 6.6, 10.3_
-  - [ ] 5.6 Implement idempotent `fsk_free_blocks`
+  - [x] 5.6 Implement idempotent `fsk_free_blocks`
     - Use `heap_caps_free` for both blocks and pointer table.
     - Be safe after partial allocation and safe when called more than once.
     - Null/reset all payload state after cleanup.

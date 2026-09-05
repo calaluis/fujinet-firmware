@@ -2,6 +2,8 @@
 
 #include "cassette.h"
 
+#include "fsk_plan.h"
+
 #include <cstring>
 
 #include "../../include/debug.h"
@@ -1938,5 +1940,288 @@ size_t sioCassette::send_turbo2000_tape_block(size_t offset)
     return 0;
 #endif
 }
+
+// =====================================================================
+// A8CAS raw FSK ("fsk ") chunk playback — Task 5: segmented whole-payload
+// preload into internal RAM.
+//
+// This section implements ONLY the preload half of the feature:
+//   * structural bounds derivation (cross-platform, pure),
+//   * ESP internal-DRAM pointer-table + block allocation,
+//   * filling the blocks through the frozen fsk_preload_into_blocks helper
+//     via a production fnio::fread reader adapter,
+//   * runtime-preload-failure handling (no partial waveform), and
+//   * the idempotent fsk_free_blocks() cleanup.
+//
+// It does NOT emit any waveform, does NOT touch the RMT peripheral, does NOT
+// implement play_fsk_chunk emission/lifecycle, and does NOT modify the chunk
+// walker. Those belong to Tasks 6/7/8.
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// Task 5.1 — Structural bounds (cross-platform, pure, no I/O, no alloc).
+//
+// Requires a complete 8-byte A8CAS chunk header at `offset`. If fewer than 8
+// bytes remain in the image, the caller must treat this as end-of-tape
+// (Req 6.1); this helper returns false in that case.
+//
+// On success, `data_avail` is the clamped payload length
+//   data_avail = min(declared_len, bytes_remaining_after_header)
+// and `structurally_truncated` reports whether the declared length would have
+// passed EOF (i.e. the image is shorter than the chunk claims). A structurally
+// truncated chunk is NOT a failure here: its fully-present clamped prefix may
+// still be preloaded and reproduced (Req 6.3/6.5). `value_count` is
+// data_avail / 2 (floor); any unpaired trailing odd byte is ignored (Req 6.4).
+// ---------------------------------------------------------------------
+[[maybe_unused]] static bool fsk_compute_bounds(size_t filesize, size_t offset,
+                                                uint16_t declared_len,
+                                                size_t &data_avail,
+                                                size_t &value_count,
+                                                bool &structurally_truncated)
+{
+    // Deterministic zeroed outputs for every path, including every return-false
+    // path below (offset past EOF, and < 8 header bytes remaining).
+    data_avail = 0;
+    value_count = 0;
+    structurally_truncated = false;
+
+    if (filesize < offset)
+        return false; // defensive: offset past EOF — no complete header
+
+    const size_t remaining = filesize - offset; // bytes from header start to EOF
+    if (remaining < 8)
+        return false; // < 8 header bytes remain -> end-of-tape (Req 6.1)
+
+    const size_t after_header = remaining - 8;
+    const size_t declared = static_cast<size_t>(declared_len);
+
+    structurally_truncated = (declared > after_header);
+    data_avail = structurally_truncated ? after_header : declared;
+    value_count = fsk_value_count(data_avail); // floor(data_avail / 2), Req 6.4
+    return true;
+}
+
+#ifdef ESP_PLATFORM
+
+// ---------------------------------------------------------------------
+// Task 5.4 — production reader adapter around fnio::fread.
+//
+// Matches the frozen fsk_read_fn signature. `ctx` is the open fnFile*, already
+// positioned at the next byte to read. Returns the number of bytes actually
+// delivered (0 == EOF/error, per the frozen helper's contract). fnio::fread is
+// called with element size 1 so its return value is a byte count. The caller
+// (fsk_preload_into_blocks) never requests more than FSK_PRELOAD_READ_MAX bytes
+// in one call, so no single fread exceeds 512 bytes (below the TNFS 525-byte
+// per-read limit).
+// ---------------------------------------------------------------------
+static size_t fsk_fnio_reader(void *ctx, uint8_t *dst, size_t n)
+{
+    fnFile *f = static_cast<fnFile *>(ctx);
+    if (f == nullptr || dst == nullptr || n == 0)
+        return 0;
+    return fnio::fread(dst, 1, n, f);
+}
+
+#endif // ESP_PLATFORM
+
+#ifdef ESP_PLATFORM
+
+// ---------------------------------------------------------------------
+// Free helper (TU-local) shared by fsk_free_blocks() and the preload failure
+// paths. Frees every allocated block and the pointer table with heap_caps_free,
+// then nulls the table pointer and zeroes the block bookkeeping. Safe after a
+// partial allocation (some block entries may be nullptr), after a full
+// allocation, and when called more than once.
+// ---------------------------------------------------------------------
+static void fsk_release_blocks(uint8_t **&blocks, size_t &block_size,
+                               size_t &block_count)
+{
+    if (blocks != nullptr)
+    {
+        for (size_t i = 0; i < block_count; ++i)
+        {
+            if (blocks[i] != nullptr)
+            {
+                heap_caps_free(blocks[i]);
+                blocks[i] = nullptr;
+            }
+        }
+        heap_caps_free(blocks);
+        blocks = nullptr;
+    }
+    block_size = 0;
+    block_count = 0;
+}
+
+// ---------------------------------------------------------------------
+// Task 5.6 — idempotent cleanup (ESP-only; fsk_free_blocks is declared under
+// #ifdef ESP_PLATFORM in cassette.h, so its definition lives here too).
+//
+// Frees every allocated payload block and the pointer table, then nulls/resets
+// ALL payload + ISR-cursor state. Safe after a partial allocation, after a full
+// allocation, and when called more than once.
+//
+// On the PC build there is no preload/allocation and no such member, so nothing
+// is defined here.
+// ---------------------------------------------------------------------
+void sioCassette::fsk_free_blocks()
+{
+    fsk_release_blocks(_fsk_blocks, _fsk_block_size, _fsk_block_count);
+
+    _fsk_payload_len = 0;
+
+    // O(1) ISR-only encoder cursor — reset to a clean baseline.
+    _fsk_value_count = 0;
+    _fsk_value_index = 0;
+    _fsk_payload_pos = 0;
+    _fsk_remaining_ticks = 0;
+    _fsk_level_high = false;
+}
+
+// ---------------------------------------------------------------------
+// Tasks 5.2 / 5.3 / 5.4 / 5.5 — allocate the segmented block table in internal
+// 8-bit DRAM, fill it fully from the file, and fail safely (no partial
+// waveform) if the runtime preload cannot complete.
+//
+// This is a TU-local free function (not a class method) so it introduces no new
+// declaration into the frozen cassette.h. Because it is not a member of
+// sioCassette, it cannot reference the private static constexpr constants
+// FSK_PRELOAD_BLOCK_BYTES / FSK_PRELOAD_READ_MAX directly; the caller passes
+// them in as `preload_block_bytes` / `preload_read_max` instead. It operates
+// entirely through the caller-owned state passed by reference, plus the open
+// file and the frozen pure helpers. play_fsk_chunk (Task 7), being a member,
+// will call it with those private constants:
+//   fsk_preload_payload(_file, payload_start, data_avail,
+//                       FSK_PRELOAD_BLOCK_BYTES, FSK_PRELOAD_READ_MAX,
+//                       _fsk_blocks, _fsk_block_size, _fsk_block_count,
+//                       _fsk_payload_len, _fsk_value_count);
+//
+// Preconditions: `data_avail` was computed by fsk_compute_bounds() and is in
+// [0, 65535]. `file` is the open CAS image; `payload_start` is the absolute
+// file offset of the first FSK data byte (chunk header start + 8).
+// `preload_block_bytes` is the segmented block size and `preload_read_max` is
+// the per-read cap (both supplied by the caller from the class constants). The
+// caller must have released any prior payload (all block state at a clean
+// baseline).
+//
+// On success: the block state + value_count are populated, the whole clamped
+// payload is resident and immutable, and true is returned.
+//
+// On ANY failure (table alloc, block alloc, fseek, or short/EOF read before the
+// clamped payload is complete): every already-allocated block + the table are
+// freed, all block state is reset, and false is returned. The caller must NOT
+// emit a partial waveform in that case (Req 10.3). UART/baud are untouched here.
+//
+// A data_avail of 0 is a valid "no values" result: nothing is allocated, state
+// is left clean, and true is returned (the caller honors the IRG only).
+// ---------------------------------------------------------------------
+[[maybe_unused]] static bool fsk_preload_payload(
+    fnFile *file, size_t payload_start, size_t data_avail,
+    size_t preload_block_bytes, size_t preload_read_max,
+    uint8_t **&blocks, size_t &block_size, size_t &block_count,
+    size_t &payload_len, size_t &value_count)
+{
+    // Start from a clean, idempotent baseline.
+    fsk_release_blocks(blocks, block_size, block_count);
+    payload_len = 0;
+    value_count = 0;
+
+    if (file == nullptr)
+    {
+        Debug_printf("FSK preload: no open file\r\n");
+        return false;
+    }
+
+    if (data_avail == 0)
+    {
+        // No payload to load; IRG-only case. Set block_size consistently from
+        // the configured block size (0 is acceptable here — nothing is read).
+        block_size = preload_block_bytes;
+        return true;
+    }
+
+    // Defensive validation: a non-empty payload needs valid, non-zero config.
+    if (preload_block_bytes == 0)
+    {
+        Debug_printf("FSK preload: invalid preload_block_bytes == 0\r\n");
+        return false;
+    }
+    if (preload_read_max == 0)
+    {
+        Debug_printf("FSK preload: invalid preload_read_max == 0\r\n");
+        return false;
+    }
+
+    const size_t bsize = preload_block_bytes; // e.g. 512 (from the class const)
+    const size_t bcount =
+        (data_avail + bsize - 1) / bsize; // ceil, <= 128 for a uint16 length
+
+    // Task 5.2 — pointer table in internal 8-bit DRAM (zeroed so partial-alloc
+    // cleanup can rely on nullptr entries).
+    uint8_t **tbl = static_cast<uint8_t **>(
+        heap_caps_calloc(bcount, sizeof(uint8_t *),
+                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (tbl == nullptr)
+    {
+        Debug_printf("FSK preload: pointer table alloc failed (%u entries)\r\n",
+                     (unsigned)bcount);
+        return false; // genuine internal-RAM exhaustion (Req 10.3)
+    }
+
+    // Publish the (still being filled) table so the failure paths can clean up
+    // every block allocated so far.
+    blocks = tbl;
+    block_size = bsize;
+    block_count = bcount;
+
+    // Task 5.3 — each payload block in internal 8-bit DRAM.
+    for (size_t i = 0; i < bcount; ++i)
+    {
+        blocks[i] = static_cast<uint8_t *>(
+            heap_caps_malloc(bsize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        if (blocks[i] == nullptr)
+        {
+            Debug_printf("FSK preload: block %u/%u alloc failed\r\n",
+                         (unsigned)i, (unsigned)bcount);
+            fsk_release_blocks(blocks, block_size, block_count);
+            return false; // genuine internal-RAM exhaustion (Req 10.3)
+        }
+    }
+
+    // Task 5.4 — seek to the payload start; explicitly handle fseek failure.
+    if (fnio::fseek(file, static_cast<long int>(payload_start), SEEK_SET) != 0)
+    {
+        Debug_printf("FSK preload: fseek to %u failed\r\n",
+                     (unsigned)payload_start);
+        fsk_release_blocks(blocks, block_size, block_count);
+        return false; // runtime preload failure (Req 5.4/10.3)
+    }
+
+    // Fill the whole clamped payload through the frozen helper. It requests at
+    // most `preload_read_max` (512 in production, from the class const) bytes
+    // per reader call and accumulates positive short reads until `data_avail`
+    // bytes are resident.
+    const size_t loaded =
+        fsk_preload_into_blocks(blocks, bcount, bsize, data_avail,
+                                preload_read_max, fsk_fnio_reader, file);
+
+    // Task 5.5 — if the reader returned 0 before the clamped payload was fully
+    // loaded, this is a RUNTIME preload failure: free everything and emit no
+    // partial waveform. (This is distinct from a structurally truncated CAS,
+    // whose already-clamped data_avail prefix loads completely here.)
+    if (loaded != data_avail)
+    {
+        Debug_printf("FSK preload: short read (%u of %u bytes)\r\n",
+                     (unsigned)loaded, (unsigned)data_avail);
+        fsk_release_blocks(blocks, block_size, block_count);
+        return false;
+    }
+
+    payload_len = data_avail;
+    value_count = fsk_value_count(data_avail);
+    return true;
+}
+
+#endif // ESP_PLATFORM
 
 #endif /* BUILD_ATARI */
