@@ -177,3 +177,41 @@ FskStep fsk_view_step(FskChunkView &view)
     // Case 3: all values exhausted and nothing left to split.
     return FskStep{ false, false, 0, true };
 }
+
+
+// -----------------------------------------------------------------------------
+// Structural chunk bounds + caller next-offset (pure)
+// -----------------------------------------------------------------------------
+//
+// This is the single source of truth for the structural bounds/next-offset rule.
+// The production caller (sioCassette::play_fsk_chunk) consumes this exact result;
+// there is no second O+8+L formula. The arithmetic mirrors the prior in-cassette
+// logic byte-for-byte: subtraction-guarded so it never underflows.
+FskBounds fsk_compute_bounds(size_t filesize, size_t offset,
+                             uint16_t declared_len)
+{
+    // Deterministic zeroed result for every early-return path.
+    FskBounds b{ 0, 0, 0, false, false };
+
+    if (filesize < offset)
+        return b; // defensive: offset past EOF -> no complete header (next=0)
+
+    const size_t remaining = filesize - offset; // bytes from header start to EOF
+    if (remaining < 8)
+        return b; // < 8 header bytes remain -> end-of-tape (Req 6.1); next=0
+
+    b.header_complete = true;
+
+    const size_t after_header = remaining - 8;
+    const size_t declared = static_cast<size_t>(declared_len);
+
+    b.structurally_truncated = (declared > after_header);
+    b.data_avail = b.structurally_truncated ? after_header : declared;
+    b.value_count = fsk_value_count(b.data_avail); // floor(data_avail / 2), Req 6.4
+
+    // Well-formed chunk advances past its full declared extent (O + 8 + L);
+    // an overrun/truncated chunk terminates at EOT (next = 0), because
+    // offset + 8 + declared would point past the image.
+    b.next_offset = b.structurally_truncated ? 0 : (offset + 8 + declared);
+    return b;
+}

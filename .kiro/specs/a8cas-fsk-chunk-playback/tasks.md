@@ -79,7 +79,7 @@ Tasks should be completed in order. Every implementation task below starts unche
     - Verify `6818 -> 681800 ticks -> 21 portions` as generic split arithmetic only, not as a title-specific signature.
     - Verify `65535 -> 6553500 ticks -> 201 portions`.
     - _Requirements: 2.1-2.8, 4.6, 6.4_
-  - [ ] 3.2 Update deterministic correctness-property tests to Properties 1-9 from the approved design
+  - [x] 3.2 Update deterministic correctness-property tests to Properties 1-9 from the approved design
     - Property 1: value count is `floor(len/2)`.
     - Property 2: decoded values produce total duration `value * 100` ticks.
     - Property 3: every emitted portion follows original value-index parity.
@@ -264,7 +264,7 @@ Tasks should be completed in order. Every implementation task below starts unche
   - [x] 10.1 Run `fsk_plan_tests`
     - Confirm all example, block-table, preload-reader, generated-property, odd/truncated, and max-value tests pass.
     - _Requirements: 2.1-2.8, 4.6, 6.1-6.6, 10.1-10.4_
-  - [ ] 10.2 Build and exercise fujinet-pc
+  - [x] 10.2 Build and exercise fujinet-pc
     - Confirm no ESP-only API leaks into the PC build.
     - Exercise synthetic interleaved and pure raw-FSK images where practical.
     - Confirm deterministic IRG handling and safe EOT behavior.

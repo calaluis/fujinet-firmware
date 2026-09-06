@@ -158,6 +158,46 @@ size_t fsk_preload_into_blocks(uint8_t *const *blocks,
                                void *ctx);
 
 // -----------------------------------------------------------------------------
+// Structural chunk bounds + caller next-offset (pure, host-testable)
+// -----------------------------------------------------------------------------
+//
+// All derived structural state for one A8CAS chunk in ONE result, so the
+// production caller (sioCassette::play_fsk_chunk) and the host property tests
+// use the SAME next-offset rule — there is no second O+8+L formula anywhere.
+//
+// Integer widths mirror the production caller: file size / offsets / byte
+// counts are size_t; the declared chunk length is the on-file uint16.
+// Arithmetic is subtraction-guarded (offset-past-EOF and <8-remaining checked
+// before any subtraction) so it never underflows.
+struct FskBounds
+{
+    size_t data_avail;            // min(declared_len, bytes after the 8-byte header)
+    size_t value_count;           // floor(data_avail / 2) (Req 6.4)
+    size_t next_offset;           // caller's next read offset: O+8+L when well-formed,
+                                  //   0 for incomplete header or body overrun (EOT)
+    bool   header_complete;       // false when < 8 header bytes remain (or offset > filesize)
+    bool   structurally_truncated;// declared body would pass EOF (clamped to what exists)
+};
+
+// Compute the structural bounds + next offset for a chunk header at `offset`
+// within a file of `filesize` bytes declaring `declared_len` payload bytes.
+//
+// Rules (design "Malformed Chunk Policy" / Property 7):
+//   - offset > filesize OR remaining < 8  -> header_complete=false, everything 0,
+//                                            next_offset=0 (EOT)
+//   - declared_len > body_available       -> structurally_truncated=true,
+//                                            data_avail=body_available,
+//                                            next_offset=0 (EOT/overrun)
+//   - well-formed                         -> data_avail=declared_len,
+//                                            next_offset=offset+8+declared_len
+// value_count is always floor(data_avail/2).
+//
+// Pure: no I/O, no hardware, no globals. This is the single source of truth for
+// the production caller and the host tests.
+FskBounds fsk_compute_bounds(size_t filesize, size_t offset,
+                             uint16_t declared_len);
+
+// -----------------------------------------------------------------------------
 // Pure host-test cursor over a segmented payload
 // -----------------------------------------------------------------------------
 

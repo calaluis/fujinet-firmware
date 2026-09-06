@@ -696,6 +696,16 @@ size_t sioCassette::send_FUJI_tape_block(size_t offset)
 
     // TO DO : check that "data" record was actually found - not done by SDrive until after IRG by checking offset<filesize
 
+    // The legacy data-record post-processing below (gap loop + data transmit)
+    // must run ONLY when the search loop broke on a 'data' chunk. If the loop
+    // instead exited because offset reached filesize (a pure-FSK image, or after
+    // the final FSK/non-data chunk), `hdr` still holds that last non-data header
+    // and any FSK IRG was already honored inside play_fsk_chunk. Terminating at
+    // EOT here prevents a duplicate IRG / stale-header fallthrough (design
+    // Architecture: a pure raw-FSK image ends via the while-loop condition).
+    if (offset >= filesize)
+        return 0; // end-of-tape
+
     gap = hdr->irg_length; //save GAP
     len = hdr->chunk_length;
     Debug_printf("Baud: %u Length: %u Gap: %u ", baud, len, gap);
@@ -2015,47 +2025,16 @@ size_t sioCassette::send_turbo2000_tape_block(size_t offset)
 // =====================================================================
 
 // ---------------------------------------------------------------------
-// Task 5.1 — Structural bounds (cross-platform, pure, no I/O, no alloc).
+// Task 5.1 — Structural bounds (cross-platform, pure).
 //
-// Requires a complete 8-byte A8CAS chunk header at `offset`. If fewer than 8
-// bytes remain in the image, the caller must treat this as end-of-tape
-// (Req 6.1); this helper returns false in that case.
-//
-// On success, `data_avail` is the clamped payload length
-//   data_avail = min(declared_len, bytes_remaining_after_header)
-// and `structurally_truncated` reports whether the declared length would have
-// passed EOF (i.e. the image is shorter than the chunk claims). A structurally
-// truncated chunk is NOT a failure here: its fully-present clamped prefix may
-// still be preloaded and reproduced (Req 6.3/6.5). `value_count` is
-// data_avail / 2 (floor); any unpaired trailing odd byte is ignored (Req 6.4).
+// The bounds/next-offset rule now lives in the pure, host-testable helper
+// `fsk_compute_bounds()` in fsk_plan (returns an FskBounds with data_avail,
+// value_count, next_offset, header_complete, structurally_truncated). This is
+// the SINGLE source of truth: play_fsk_chunk consumes that exact result,
+// including bounds.next_offset — there is no second O+8+L formula here. See
+// fsk_plan.h / fsk_plan.cpp. The property tests (P7/P9) exercise the same
+// helper, so the tested logic is the production logic.
 // ---------------------------------------------------------------------
-[[maybe_unused]] static bool fsk_compute_bounds(size_t filesize, size_t offset,
-                                                uint16_t declared_len,
-                                                size_t &data_avail,
-                                                size_t &value_count,
-                                                bool &structurally_truncated)
-{
-    // Deterministic zeroed outputs for every path, including every return-false
-    // path below (offset past EOF, and < 8 header bytes remaining).
-    data_avail = 0;
-    value_count = 0;
-    structurally_truncated = false;
-
-    if (filesize < offset)
-        return false; // defensive: offset past EOF — no complete header
-
-    const size_t remaining = filesize - offset; // bytes from header start to EOF
-    if (remaining < 8)
-        return false; // < 8 header bytes remain -> end-of-tape (Req 6.1)
-
-    const size_t after_header = remaining - 8;
-    const size_t declared = static_cast<size_t>(declared_len);
-
-    structurally_truncated = (declared > after_header);
-    data_avail = structurally_truncated ? after_header : declared;
-    value_count = fsk_value_count(data_avail); // floor(data_avail / 2), Req 6.4
-    return true;
-}
 
 #ifdef ESP_PLATFORM
 
@@ -2680,26 +2659,35 @@ size_t sioCassette::play_fsk_chunk(size_t offset, uint16_t chunk_length,
     const size_t starting_offset = offset;
 
     // ---- 1. Structural bounds (cross-platform, pure) ----
-    size_t data_avail = 0;
-    size_t value_count = 0;
-    bool structurally_truncated = false;
-    if (!fsk_compute_bounds(filesize, offset, chunk_length, data_avail,
-                            value_count, structurally_truncated))
+    // Single source of truth: the pure, host-tested fsk_compute_bounds() helper
+    // (fsk_plan) derives ALL structural state, including the caller's next
+    // offset. play_fsk_chunk consumes bounds.next_offset directly — it does NOT
+    // recompute O+8+L independently. The property tests exercise this same
+    // helper (P7/P9).
+    const FskBounds bounds = fsk_compute_bounds(filesize, offset, chunk_length);
+    if (!bounds.header_complete)
     {
         // Fewer than 8 header bytes remain (or impossible offset): end-of-tape.
         // No read past EOF, no allocation, no signal. (Req 6.1, 8.4)
         return 0;
     }
 
-    // Structural next-offset: a well-formed chunk advances past its declared
-    // extent; a structurally truncated/overrun chunk terminates at EOT (0),
-    // because offset + 8 + chunk_length would point past the image. This is a
-    // STRUCTURAL decision independent of any runtime preload outcome.
-    const size_t next_offset =
-        structurally_truncated ? 0 : (offset + 8 + (size_t)chunk_length);
+    const size_t data_avail = bounds.data_avail;
+    const size_t value_count = bounds.value_count;
+    const bool structurally_truncated = bounds.structurally_truncated;
+    // value_count / structurally_truncated are consumed on the PC path; mark them
+    // used so the ESP build, which derives its own _fsk_value_count via the
+    // preload, emits no unused-variable warning.
+    (void)value_count;
+    (void)structurally_truncated;
+
+    // Structural next-offset comes from the shared helper (well-formed -> O+8+L;
+    // truncated/overrun -> 0 = EOT). Independent of any runtime preload outcome.
+    const size_t next_offset = bounds.next_offset;
 
     // result is assigned on entry to each terminal condition; every path funnels
-    // through the single `done:` cleanup label below.
+    // through the single `done:` cleanup label below. (Motor-abort still returns
+    // starting_offset separately, unchanged by this refactor.)
     size_t result = next_offset;
 
 #ifdef ESP_PLATFORM

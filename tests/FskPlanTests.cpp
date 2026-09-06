@@ -9,6 +9,7 @@
 #include <initializer_list>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 // FskPlanTests.cpp — doctest coverage for the pure A8CAS FSK rules in
@@ -1460,4 +1461,350 @@ TEST_CASE("Task 3.6 interleaved image: fsk is non-terminating; baud governs data
     CHECK(r.portion_count == 2);
     CHECK(r.first_level == false); // index 0 even -> logical 0
     CHECK(r.total_ticks == fsk_ticks_for_value(100) + fsk_ticks_for_value(200));
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// Property 7 / 8 / 9 — deterministic host coverage over the PRODUCTION helpers.
+//
+// These exercise the SAME pure functions the production caller uses:
+//   - fsk_compute_bounds()  (structural bounds + caller next_offset)  -> P7, P9
+//   - fsk_value_count() / fsk_view_step()  (cursor)                    -> P9
+//   - the fsk_plan step/cursor signatures + outputs                    -> P8
+// No implementation formula is duplicated here: P7/P9 assert the DESIGN
+// contract against fsk_compute_bounds' returned FskBounds, and P9 also drives
+// the real cursor. The FskPlanTests target links only fsk_plan.cpp + host code.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── Property 7: truncation is deterministic and terminating ────────────────────
+// Feature: a8cas-fsk-chunk-playback, Property 7: truncation is deterministic and
+// terminating.
+TEST_CASE("P7 fsk_compute_bounds is deterministic and terminating")
+{
+    // --- Enumerated design-contract corner cases -------------------------------
+
+    SUBCASE("offset > filesize -> incomplete header, next=0")
+    {
+        FskBounds b = fsk_compute_bounds(/*filesize*/ 10, /*offset*/ 20, /*len*/ 4);
+        CHECK(b.header_complete == false);
+        CHECK(b.next_offset == 0);
+        CHECK(b.data_avail == 0);
+        CHECK(b.value_count == 0);
+        CHECK(b.structurally_truncated == false);
+    }
+
+    SUBCASE("fewer than 8 bytes remain -> incomplete header, next=0")
+    {
+        for (size_t remaining = 0; remaining < 8; ++remaining)
+        {
+            const size_t filesize = 1000;
+            const size_t offset = filesize - remaining; // 0..7 bytes remain
+            FskBounds b = fsk_compute_bounds(filesize, offset, 4);
+            CHECK(b.header_complete == false);
+            CHECK(b.next_offset == 0);
+            CHECK(b.data_avail == 0);
+            CHECK(b.value_count == 0);
+        }
+    }
+
+    SUBCASE("exactly 8 bytes remain with len=0 -> well-formed empty chunk")
+    {
+        const size_t filesize = 100;
+        const size_t offset = filesize - 8; // exactly the header, zero body
+        FskBounds b = fsk_compute_bounds(filesize, offset, 0);
+        CHECK(b.header_complete == true);
+        CHECK(b.structurally_truncated == false);
+        CHECK(b.data_avail == 0);
+        CHECK(b.value_count == 0);
+        CHECK(b.next_offset == offset + 8); // O + 8 + 0
+    }
+
+    SUBCASE("body overrun by 1 and larger -> truncated, next=0")
+    {
+        const size_t filesize = 200;
+        const size_t offset = 8;
+        const size_t after_header = filesize - offset - 8; // 184 bytes available
+        // declared just past the available body, and much larger, all overrun.
+        for (size_t over : { (size_t)1, (size_t)2, (size_t)37, (size_t)1000 })
+        {
+            const size_t declared = after_header + over;
+            if (declared > 0xFFFF) continue; // uint16 declared field
+            FskBounds b = fsk_compute_bounds(filesize, offset, (uint16_t)declared);
+            CHECK(b.structurally_truncated == true);
+            CHECK(b.header_complete == true);
+            CHECK(b.data_avail == after_header);          // clamped to what exists
+            CHECK(b.value_count == after_header / 2);      // floor
+            CHECK(b.next_offset == 0);                     // overrun -> EOT
+        }
+    }
+
+    SUBCASE("well-formed len=0")
+    {
+        FskBounds b = fsk_compute_bounds(64, 8, 0);
+        CHECK(b.header_complete == true);
+        CHECK(b.structurally_truncated == false);
+        CHECK(b.data_avail == 0);
+        CHECK(b.value_count == 0);
+        CHECK(b.next_offset == 8 + 8 + 0);
+    }
+
+    SUBCASE("well-formed representative lengths")
+    {
+        const size_t filesize = 70000; // room for a 65535-byte payload
+        const size_t offset = 8;
+        for (uint32_t len : { 1u, 2u, 3u, 4u, 5u, 100u, 512u, 1024u, 65534u, 65535u })
+        {
+            FskBounds b = fsk_compute_bounds(filesize, offset, (uint16_t)len);
+            CHECK(b.header_complete == true);
+            CHECK(b.structurally_truncated == false);
+            CHECK(b.data_avail == len);
+            CHECK(b.value_count == len / 2);          // floor: odd tail dropped
+            CHECK(b.next_offset == offset + 8 + len); // O + 8 + L
+        }
+    }
+
+    // --- Generated loop over offsets x declared lengths for a fixed file --------
+    SUBCASE("generated offsets x lengths: contract holds for every case")
+    {
+        const size_t filesize = 4096;
+        for (size_t offset = 0; offset <= filesize + 4; ++offset)
+        {
+            for (uint32_t len = 0; len <= 300; ++len)
+            {
+                FskBounds b = fsk_compute_bounds(filesize, offset, (uint16_t)len);
+
+                if (offset > filesize || (filesize - offset) < 8)
+                {
+                    CHECK(b.header_complete == false);
+                    CHECK(b.next_offset == 0);
+                    CHECK(b.data_avail == 0);
+                    CHECK(b.value_count == 0);
+                    continue;
+                }
+
+                const size_t after_header = filesize - offset - 8;
+                CHECK(b.header_complete == true);
+                if (len > after_header)
+                {
+                    CHECK(b.structurally_truncated == true);
+                    CHECK(b.data_avail == after_header);
+                    CHECK(b.next_offset == 0);
+                }
+                else
+                {
+                    CHECK(b.structurally_truncated == false);
+                    CHECK(b.data_avail == len);
+                    CHECK(b.next_offset == offset + 8 + len);
+                }
+                CHECK(b.value_count == b.data_avail / 2);
+            }
+        }
+    }
+
+    // --- Offsets/filesizes near the maximum of the production integer type -----
+    SUBCASE("near size_t maximum: guarded arithmetic, no underflow/overflow")
+    {
+        const size_t MAX = ~static_cast<size_t>(0);
+
+        // offset just past a near-max filesize -> incomplete header, next=0.
+        {
+            FskBounds b = fsk_compute_bounds(MAX - 4, MAX, 10);
+            CHECK(b.header_complete == false);
+            CHECK(b.next_offset == 0);
+        }
+        // huge filesize, tiny offset, max declared length -> well-formed.
+        {
+            const size_t offset = 8;
+            FskBounds b = fsk_compute_bounds(MAX, offset, 65535);
+            CHECK(b.header_complete == true);
+            CHECK(b.structurally_truncated == false);
+            CHECK(b.data_avail == 65535);
+            CHECK(b.next_offset == offset + 8 + 65535); // no overflow at these values
+        }
+        // exactly 7 bytes remain at the very top of the address range -> EOT.
+        {
+            FskBounds b = fsk_compute_bounds(MAX, MAX - 7, 0);
+            CHECK(b.header_complete == false);
+            CHECK(b.next_offset == 0);
+        }
+    }
+}
+
+// ─── Property 8: FSK processing carries no baud-change action ────────────────────
+// Feature: a8cas-fsk-chunk-playback, Property 8: FSK processing carries no
+// baud-change action.
+//
+// P8 is a NEGATIVE/structural property of the pure module: none of the fsk_plan
+// step/cursor/bounds functions accept or return any baud state or action. What
+// the checks below actually guarantee:
+//   (1) EXACT function-pointer signatures of the pure API are frozen, so a baud
+//       parameter/return cannot be added to any of them without breaking a
+//       static_assert (this checks whole signatures, not just one call's return
+//       type);
+//   (2) structured-binding guards freeze EACH pure state/result struct at its
+//       exact decomposable member count — FskStep (4), FskBounds (5),
+//       FskChunkView (7) — so a stray extra field (e.g. a baud field) added to
+//       ANY of them fails to compile (member COUNT, without sizeof/padding),
+//       forcing an explicit P8 review;
+//   (3) a generated run of the REAL cursor confirms its observable output is
+//       pure signal (level + ticks + done), never a baud value.
+// The member-count guards cover all three pure structs, so an added field is
+// caught regardless of its type. It does not rely on the model walker; the
+// production-caller half (no setBaudrate on the FSK path) is separately shown by
+// the interleaved_baud_fsk_data hardware/PC fixture and by code inspection, and
+// by the source-level grep (zero "baud" references in fsk_plan.{h,cpp}).
+TEST_CASE("P8 pure fsk_plan carries no baud state or action")
+{
+    // (1) Compile-time contract on the EXACT FUNCTION SIGNATURES of the pure
+    // fsk_plan API. Freezing whole function-pointer types (not just a return
+    // type of one valid call) means a baud parameter cannot be added to any of
+    // these without breaking the assertion. These traffic only in signal
+    // (levels, ticks, counts) and structure (offsets/flags) — never a baud.
+    static_assert(std::is_same<decltype(&fsk_ticks_for_value),
+                               uint32_t (*)(uint16_t)>::value,
+                  "fsk_ticks_for_value signature must stay uint32_t(uint16_t) — "
+                  "no baud parameter");
+    static_assert(std::is_same<decltype(&fsk_level_for_index),
+                               bool (*)(size_t)>::value,
+                  "fsk_level_for_index signature must stay bool(size_t) — "
+                  "no baud parameter");
+    static_assert(std::is_same<decltype(&fsk_value_count),
+                               size_t (*)(size_t)>::value,
+                  "fsk_value_count signature must stay size_t(size_t) — "
+                  "no baud parameter");
+    static_assert(std::is_same<decltype(&fsk_next_portion),
+                               uint32_t (*)(uint32_t)>::value,
+                  "fsk_next_portion signature must stay uint32_t(uint32_t) — "
+                  "no baud parameter");
+    static_assert(std::is_same<decltype(&fsk_view_init),
+                               FskChunkView (*)(const uint8_t *const *, size_t,
+                                                size_t)>::value,
+                  "fsk_view_init signature frozen — no baud parameter");
+    static_assert(std::is_same<decltype(&fsk_view_step),
+                               FskStep (*)(FskChunkView &)>::value,
+                  "fsk_view_step signature must stay FskStep(FskChunkView&) — "
+                  "no baud parameter and no baud return");
+    static_assert(std::is_same<decltype(&fsk_compute_bounds),
+                               FskBounds (*)(size_t, size_t, uint16_t)>::value,
+                  "fsk_compute_bounds signature frozen — no baud parameter");
+
+    // Field types of the signal/structural result types are signal/structure
+    // only (levels, ticks, counts, offsets, flags), never a baud.
+    static_assert(std::is_same<decltype(FskStep::level_high), bool>::value, "");
+    static_assert(std::is_same<decltype(FskStep::ticks), uint32_t>::value, "");
+    static_assert(std::is_same<decltype(FskBounds::data_avail), size_t>::value, "");
+    static_assert(std::is_same<decltype(FskBounds::value_count), size_t>::value, "");
+    static_assert(std::is_same<decltype(FskBounds::next_offset), size_t>::value, "");
+
+    // Exact-member-count structural guards for the pure state/result structs:
+    // a structured binding to exactly N names compiles ONLY if the struct has
+    // EXACTLY N decomposable data members. Adding any extra state field (e.g. a
+    // stray baud field) to one of these makes its binding fail to compile,
+    // forcing an explicit P8 review/update. This is the semantic member-count
+    // check the field-type asserts cannot provide, WITHOUT sizeof()/padding.
+    // Member counts/order are taken from the actual fsk_plan.h definitions.
+
+    // FskStep: exactly 4 members {produced, level_high, ticks, done}.
+    {
+        FskStep probe{};
+        const auto &[p_produced, p_level, p_ticks, p_done] = probe;
+        (void)p_produced; (void)p_level; (void)p_ticks; (void)p_done;
+    }
+
+    // FskBounds: exactly 5 members
+    // {data_avail, value_count, next_offset, header_complete, structurally_truncated}.
+    {
+        FskBounds probe{};
+        const auto &[b_data, b_vcount, b_next, b_hdr, b_trunc] = probe;
+        (void)b_data; (void)b_vcount; (void)b_next; (void)b_hdr; (void)b_trunc;
+    }
+
+    // FskChunkView: exactly 7 members
+    // {blocks, block_size, data_len_available, value_index, byte_pos,
+    //  remaining_ticks, remaining_level_high}.
+    {
+        FskChunkView probe = fsk_view_init(nullptr, 0, 0);
+        const auto &[v_blocks, v_bsize, v_len, v_vidx, v_bpos, v_rem, v_lvl] = probe;
+        (void)v_blocks; (void)v_bsize; (void)v_len; (void)v_vidx; (void)v_bpos;
+        (void)v_rem; (void)v_lvl;
+    }
+
+    // (2) Generated run of the real cursor over varied chunks: every emitted
+    // portion is signal-only (a level bit + a tick count). There is no baud
+    // channel to observe because the module has none; this confirms the cursor's
+    // observable output stays within {level, ticks, done} for all inputs.
+    for (uint32_t seed = 1; seed <= 200; ++seed)
+    {
+        // Deterministic pseudo-random value sequence.
+        std::vector<uint16_t> values;
+        uint32_t s = seed * 2654435761u;
+        const size_t n = 1 + (seed % 9);
+        for (size_t i = 0; i < n; ++i)
+        {
+            s = s * 1103515245u + 12345u;
+            values.push_back((uint16_t)((s >> 16) & 0xFFFF));
+        }
+
+        // Lay the values into a contiguous payload and drive the real cursor.
+        std::vector<uint8_t> payload;
+        for (uint16_t v : values)
+        {
+            payload.push_back((uint8_t)(v & 0xFF));
+            payload.push_back((uint8_t)((v >> 8) & 0xFF));
+        }
+        BlockTable bt(payload.data(), payload.size(), 512);
+        FskChunkView view =
+            fsk_view_init(bt.blocks(), bt.block_size(), payload.size());
+
+        int guard = 0;
+        for (;;)
+        {
+            FskStep step = fsk_view_step(view);
+            if (step.produced)
+            {
+                // The only observable outputs are a logical level and a tick
+                // count — both signal, never baud.
+                CHECK((step.level_high == false || step.level_high == true));
+                CHECK(step.ticks >= 1);
+                CHECK(step.ticks <= FSK_MAX_PORTION_TICKS);
+            }
+            if (step.done) break;
+            if (++guard > 2000000) { CHECK_MESSAGE(false, "cursor did not terminate"); break; }
+        }
+    }
+}
+
+// ─── Property 9: zero-length chunk is IRG-only ──────────────────────────────────
+// Feature: a8cas-fsk-chunk-playback, Property 9: zero-length chunk is IRG-only.
+//
+// For generated valid offsets/filesizes with declared_len == 0, using the SAME
+// production helper plus the real cursor:
+//   fsk_value_count(0) == 0
+//   cursor produces zero portions and is immediately done
+//   structurally_truncated == false, data_avail == 0
+//   next_offset == O + 8
+TEST_CASE("P9 zero-length chunk is IRG-only across generated offsets")
+{
+    CHECK(fsk_value_count(0) == 0); // direct pure-helper contract
+
+    const size_t filesize = 8192;
+    // Several generated offsets, not one hard-coded example. Only offsets with
+    // room for a complete header are well-formed zero-length chunks.
+    for (size_t offset = 0; offset + 8 <= filesize; offset += 17)
+    {
+        FskBounds b = fsk_compute_bounds(filesize, offset, /*declared_len*/ 0);
+
+        CHECK(b.header_complete == true);
+        CHECK(b.structurally_truncated == false);
+        CHECK(b.data_avail == 0);
+        CHECK(b.value_count == 0);
+        CHECK(b.next_offset == offset + 8); // IRG-only: advance by header size
+
+        // The real cursor over a zero-length payload produces no portion and is
+        // immediately done (IRG-only, no signal work).
+        FskChunkView view = fsk_view_init(nullptr, 0, /*data_len_available*/ 0);
+        FskStep step = fsk_view_step(view);
+        CHECK(step.produced == false);
+        CHECK(step.done == true);
+    }
 }
