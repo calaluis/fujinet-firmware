@@ -277,7 +277,7 @@ Tasks should be completed in order. Every implementation task below starts unche
     - Confirm ISR-read payload remains in internal RAM even when PSRAM is available.
     - Confirm the same RMT callback/pointer-table design compiles and links.
     - _Requirements: 4.1-4.5, 7.1, 10.4_
-  - [ ] 10.5 Verify large-payload memory behavior on classic ESP32
+  - [x] 10.5 Verify large-payload memory behavior on classic ESP32
     - Test segmented allocation for payloads spanning many blocks, including a synthetic 65535-byte payload where practical.
     - Record free internal heap before allocation, peak usage, and cleanup recovery.
     - Confirm there is no artificial payload-size rejection below A8CAS limits; only genuine internal-RAM exhaustion may fail safely.
