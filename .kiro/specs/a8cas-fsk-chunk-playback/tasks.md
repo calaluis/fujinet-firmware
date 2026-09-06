@@ -273,7 +273,7 @@ Tasks should be completed in order. Every implementation task below starts unche
     - Verify `IRAM_ATTR` callback, 1 MHz RMT configuration, `min_chunk_size = 1`, internal-RAM heap-capability calls, pointer-table payload, pin routing, and cleanup all compile cleanly.
     - Watch for IRAM/cache-safety and type/signature warnings.
     - _Requirements: 4.1-4.5, 7.1, 10.4_
-  - [ ] 10.4 Build ESP32-S3 Atari FujiNet
+  - [x] 10.4 Build ESP32-S3 Atari FujiNet
     - Confirm ISR-read payload remains in internal RAM even when PSRAM is available.
     - Confirm the same RMT callback/pointer-table design compiles and links.
     - _Requirements: 4.1-4.5, 7.1, 10.4_
