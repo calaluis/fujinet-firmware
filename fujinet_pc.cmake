@@ -227,6 +227,7 @@ set(SOURCES src/main.cpp
     lib/TNFSlib/tnfslibMountInfo.h lib/TNFSlib/tnfslibMountInfo.cpp
     lib/TNFSlib/tnfslib.h lib/TNFSlib/tnfslib.cpp
     lib/TNFSlib/tnfslib_udp.h lib/TNFSlib/tnfslib_udp_testing.cpp
+    lib/TNFSlib/tnfslib_framing.h lib/TNFSlib/tnfslib_framing.cpp
     lib/telnet/libtelnet.h lib/telnet/libtelnet.c
     lib/fnjson/fnjson.h lib/fnjson/fnjson.cpp
     lib/fnhtml/fnhtml.h lib/fnhtml/fnhtml.cpp
