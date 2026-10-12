@@ -6,6 +6,7 @@
 // later runs the work for every due client. Fixed capacity, no heap.
 
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 
 class tnfsKeepAliveQueue
@@ -14,7 +15,7 @@ public:
     static constexpr int CAPACITY = 8; // one per host slot
     using Work = void (*)(void *client);
 
-    // False if the queue is full or `client` is already registered.
+    // False if the queue is full, `client` is already registered, or its address is odd.
     bool add(void *client);
 
     // Unregister. Waits for a running service() call, so once this returns `client` is
@@ -31,17 +32,16 @@ public:
 
     bool is_due(void *client) const;
     int registered() const;
+    int pending() const { return _pending.load(); } // due marks not yet serviced
 
 private:
-    struct Slot
-    {
-        std::atomic<void *> client{nullptr};
-        std::atomic<bool> due{false};
-    };
+    // A slot is one word: the client's address, with DUE set while it waits for service.
+    // A free slot is 0. Checking the client and setting DUE in one compare-and-swap means
+    // a mark only ever lands on the client it was aimed at, never on the next client of a
+    // reused slot.
+    static constexpr uintptr_t DUE = 1;
 
-    void clear_due(Slot &slot);
-
-    Slot _slots[CAPACITY];
+    std::atomic<uintptr_t> _slots[CAPACITY] = {};
     std::atomic<int> _pending{0};
     mutable std::mutex _lock; // serialises add, remove and service
 };

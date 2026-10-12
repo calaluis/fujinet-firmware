@@ -262,12 +262,48 @@ TEST_CASE("an expired session is recovered over WSS and the command retried")
 }
 
 // ---------------------------------------------------------------------------------------
-// Keep-alive (F1): one bounded attempt, never a reconnect, never waits for another task.
+// Keep-alive (F1): one bounded attempt, never a reconnect, never waits for another task,
+// and none at all while the mount has been in use (it would hold up the main loop).
+
+static void idle_for_keep_alive() { fnSystem.delay(30000); }
+
+TEST_CASE("keep-alive soon after a reply: skipped, no request, no time")
+{
+    Mount m;
+    REQUIRE(tnfs_mount(&m.info) == TNFS_RESULT_SUCCESS);
+    fnSystem.delay(29999);
+    int before = m.server.requests;
+    uint64_t t0 = fnSystem.millis();
+    CHECK(tnfs_ws_keepalive(&m.info) == TNFS_RESULT_SUCCESS);
+    CHECK(m.server.requests == before);
+    CHECK(elapsed_since(t0) == 0);
+
+    fnSystem.delay(1); // 30 s without a reply: due
+    CHECK(tnfs_ws_keepalive(&m.info) == TNFS_RESULT_SUCCESS);
+    CHECK(m.server.requests - before == 1);
+    // The keep-alive's own reply counts as activity.
+    CHECK(tnfs_ws_keepalive(&m.info) == TNFS_RESULT_SUCCESS);
+    CHECK(m.server.requests - before == 1);
+}
+
+TEST_CASE("keep-alive after a failed exchange is not skipped: only replies count")
+{
+    Mount m;
+    REQUIRE(tnfs_mount(&m.info) == TNFS_RESULT_SUCCESS);
+    idle_for_keep_alive();
+    m.server.mute = true;
+    CHECK(m.stat() == -1); // requests went out, no reply came back
+    m.server.mute = false;
+    int before = m.server.requests;
+    CHECK(tnfs_ws_keepalive(&m.info) == TNFS_RESULT_SUCCESS);
+    CHECK(m.server.requests - before == 1);
+}
 
 TEST_CASE("keep-alive over a live connection: one STAT, settings restored")
 {
     Mount m;
     REQUIRE(tnfs_mount(&m.info) == TNFS_RESULT_SUCCESS);
+    idle_for_keep_alive();
     int before = m.server.requests;
     uint64_t t0 = fnSystem.millis();
     CHECK(tnfs_ws_keepalive(&m.info) == TNFS_RESULT_SUCCESS);
@@ -282,6 +318,7 @@ TEST_CASE("keep-alive against a stalled server: a single short attempt, no retry
 {
     Mount m;
     REQUIRE(tnfs_mount(&m.info) == TNFS_RESULT_SUCCESS);
+    idle_for_keep_alive();
     m.server.mute = true;
     int before = m.server.requests;
     uint64_t t0 = fnSystem.millis();
@@ -298,6 +335,7 @@ TEST_CASE("keep-alive with the connection down: no reconnect, no request, no tim
 {
     Mount m;
     REQUIRE(tnfs_mount(&m.info) == TNFS_RESULT_SUCCESS);
+    idle_for_keep_alive();
     m.server.connected = false; // e.g. Wi-Fi lost or the bridge idled out
     int before = m.server.requests;
     uint64_t t0 = fnSystem.millis();
@@ -314,6 +352,7 @@ TEST_CASE("keep-alive while another task is in a transaction: skipped, never wai
 {
     Mount m;
     REQUIRE(tnfs_mount(&m.info) == TNFS_RESULT_SUCCESS);
+    idle_for_keep_alive();
     std::atomic<bool> locked{false}, release{false};
     std::thread other([&] {
         std::lock_guard<std::recursive_mutex> lock(m.info.transaction_mutex);

@@ -47,6 +47,9 @@ TEST_CASE("queue: unregistered clients and null are ignored")
     CHECK(q.service(record) == 0);
     CHECK_FALSE(q.add(nullptr));
     CHECK_FALSE(q.add(&a)); // already registered
+    // Bit 0 of a slot is the due mark, so an odd address cannot be registered.
+    CHECK_FALSE(q.add(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(&a) | 1)));
+    CHECK(q.registered() == 1);
 }
 
 TEST_CASE("queue: fixed capacity, slots are reused after remove")
@@ -67,7 +70,9 @@ TEST_CASE("queue: a removed client is never serviced, even if it was due")
     int a, b;
     REQUIRE(q.add(&a));
     q.mark_due(&a);
+    CHECK(q.pending() == 1);
     q.remove(&a);
+    CHECK(q.pending() == 0); // the fast path of service() stays cheap
     serviced.clear();
     CHECK(q.service(record) == 0);
     // A new client in the old slot does not inherit the stale mark.
@@ -139,6 +144,52 @@ TEST_CASE("queue: marking from a timer thread never blocks and is never lost")
     CHECK(hits >= 1);
     CHECK_FALSE(q.is_due(&a)); // the last mark was serviced
     CHECK(q.service(count_hit) == 0);
+}
+
+TEST_CASE("queue: a slot's new client never inherits a mark aimed at the old one (stress)")
+{
+    // Timers keep marking `a` while the main task swaps `a` and `b` in the same slot. `b`
+    // is never marked, so any due mark it shows was aimed at `a`: the registration check
+    // and the mark were not one atomic step.
+    tnfsKeepAliveQueue q;
+    int a, b;
+    REQUIRE(q.add(&a));
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> timers;
+    for (int t = 0; t < 3; t++)
+        timers.emplace_back([&] {
+            while (!stop)
+                q.mark_due(&a);
+        });
+
+    int inherited = 0;
+    long rounds = 0;
+    bool slot_lost = false; // no REQUIRE while the timer threads run: it would abort
+    auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+    while (std::chrono::steady_clock::now() < end && !slot_lost)
+    {
+        q.remove(&a);
+        slot_lost = !q.add(&b);
+        std::this_thread::yield(); // let a marker that already matched `a` finish
+        inherited += q.is_due(&b);
+        q.remove(&b);
+        slot_lost = slot_lost || !q.add(&a);
+        rounds++;
+    }
+    stop = true;
+    for (auto &t : timers)
+        t.join();
+    MESSAGE("rounds: " << rounds << ", inherited marks: " << inherited);
+    CHECK_FALSE(slot_lost); // a mark on a free slot would make it look taken
+    CHECK(inherited == 0);
+
+    // The pending count stayed balanced: nothing is left due once `a` is serviced.
+    hits = 0;
+    q.service(count_hit);
+    CHECK(q.service(count_hit) == 0);
+    CHECK(q.pending() == 0);
+    q.remove(&a);
+    CHECK(q.registered() == 0);
 }
 
 // ---------------------------------------------------------------------------------------

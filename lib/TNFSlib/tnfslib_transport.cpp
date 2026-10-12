@@ -33,6 +33,7 @@ using namespace std;
 #define TNFS_WS_POLL_TIMEOUT 20         // one read while waiting for a reply
 #define TNFS_WS_TRANSACTION_BUDGET 8000 // no new attempt starts after this
 #define TNFS_WS_KEEPALIVE_TIMEOUT 1500  // reply wait of the single keep-alive attempt
+#define TNFS_WS_KEEPALIVE_IDLE 30000    // half the 60 s period: never silent for 90 s or more
 
 static uint32_t _tnfs_stream_millis() { return (uint32_t)fnSystem.millis(); }
 
@@ -61,7 +62,10 @@ static int _tnfs_stream_recv(tnfsMountInfo *m_info, tnfsPacket &pkt)
     if (!m_info->stream_link)
         return -1;
     tnfsStreamReply r = m_info->stream_link->recv(pkt.rawData, TNFS_WS_POLL_TIMEOUT);
-    return r.status == tnfsStreamStatus::REPLY ? r.length : -1;
+    if (r.status != tnfsStreamStatus::REPLY)
+        return -1;
+    m_info->ws_last_reply_ms = _tnfs_stream_millis();
+    return r.length;
 }
 
 static bool _tnfs_stream_is_ws(tnfsMountInfo *m_info)
@@ -96,6 +100,11 @@ int tnfs_ws_keepalive(tnfsMountInfo *m_info)
     std::unique_lock<std::recursive_mutex> lock(m_info->transaction_mutex, std::try_to_lock);
     if (!lock.owns_lock())
         return -1;
+
+    // The keep-alive runs in the main loop, which also polls the host bus. A mount that
+    // replied recently is fresh for both TNFSD and the bridge: skip the round trip.
+    if (_tnfs_stream_millis() - m_info->ws_last_reply_ms < TNFS_WS_KEEPALIVE_IDLE)
+        return TNFS_RESULT_SUCCESS;
 
     // One short attempt over the open connection only: no reconnect (an idle drop is
     // repaired by the next real operation), no retry delay.

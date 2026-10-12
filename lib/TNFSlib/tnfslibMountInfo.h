@@ -107,6 +107,7 @@ public:
     uint8_t protocol = TNFS_PROTOCOL_UNKNOWN;
     fnTcpClient tcp_client;
     std::unique_ptr<tnfsStreamLink> stream_link; // TNFS_PROTOCOL_WS only
+    uint32_t ws_last_reply_ms = 0;               // TNFS_PROTOCOL_WS only: last reply received
 
     // These char[] sizes are abitrary...
     char hostname[64] = { '\0' };

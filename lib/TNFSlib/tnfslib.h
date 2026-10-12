@@ -185,7 +185,8 @@ success_is_true tnfs_ws_attach(tnfsMountInfo *m_info);
 
 // One bounded keep-alive for a TNFS_PROTOCOL_WS mount, for a task with a large stack
 // (not a timer callback): a single short attempt over the open connection, never a
-// reconnect; skipped (-1) when another task is in a transaction. Returns the TNFS result.
+// reconnect; skipped (-1) when another task is in a transaction, and skipped (success)
+// when a reply arrived in the last 30 s. Returns the TNFS result.
 int tnfs_ws_keepalive(tnfsMountInfo *m_info);
 
 //int tnfs_opendir(tnfsMountInfo *m_info, const char *directory);
