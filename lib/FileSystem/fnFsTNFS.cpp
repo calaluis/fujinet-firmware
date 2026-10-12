@@ -14,10 +14,20 @@
 #include "fnSystem.h"
 #include "fnDNS.h"
 #include "tnfslib.h"
+#include "tnfslib_stream.h"
 #include "compat_string.h"
 #include "../../include/debug.h"
 
 FileSystemTNFS fnTNFS;
+
+// A failed "_wss." mount frees its connection and does not leave the protocol behind.
+static void release_wss(tnfsMountInfo &m_info)
+{
+    if (m_info.protocol != TNFS_PROTOCOL_WS)
+        return;
+    m_info.stream_link.reset();
+    m_info.protocol = TNFS_PROTOCOL_UNKNOWN;
+}
 
 FileSystemTNFS::FileSystemTNFS()
 {
@@ -60,6 +70,14 @@ success_is_true FileSystemTNFS::start(const char *host, uint16_t port, const cha
         host_no_prefix = &host[5];
         _mountinfo.protocol = TNFS_PROTOCOL_UDP;
     }
+    else if (strncmp("_wss.", host, 5) == 0)
+    {
+        // TNFS over wss://host/, e.g. a TNFS server published through a WebSocket bridge
+        host_no_prefix = &host[5];
+        _mountinfo.protocol = TNFS_PROTOCOL_WS;
+        if (port == TNFS_DEFAULT_PORT)
+            port = TNFS_WS_DEFAULT_PORT;
+    }
     else
     {
         host_no_prefix = host;
@@ -75,6 +93,7 @@ success_is_true FileSystemTNFS::start(const char *host, uint16_t port, const cha
     if(_mountinfo.host_ip == IPADDR_NONE)
     {
         Debug_printf("Failed to resolve hostname \"%s\"\r\n", _mountinfo.hostname);
+        release_wss(_mountinfo);
         RETURN_ERROR_AS_FALSE();
     }
     // TODO: Refresh the DNS name we resolved after X amount of time
@@ -82,6 +101,13 @@ success_is_true FileSystemTNFS::start(const char *host, uint16_t port, const cha
 
     _mountinfo.port = port;
     _mountinfo.session = TNFS_INVALID_SESSION;
+
+    if (_mountinfo.protocol == TNFS_PROTOCOL_WS && !tnfs_ws_attach(&_mountinfo))
+    {
+        Debug_println("TNFS over WSS is not available");
+        release_wss(_mountinfo);
+        RETURN_ERROR_AS_FALSE();
+    }
 
     if(mountpath != nullptr)
         strlcpy(_mountinfo.mountpath, mountpath, sizeof(_mountinfo.mountpath));
@@ -106,6 +132,7 @@ success_is_true FileSystemTNFS::start(const char *host, uint16_t port, const cha
         Debug_printf("TNFS mount failed with code %d\r\n", r);
         _mountinfo.mountpath[0] = '\0';
         _started = false;
+        release_wss(_mountinfo);
         RETURN_ERROR_AS_FALSE();
     }
     Debug_printf("TNFS mount successful. session: 0x%hx, version: 0x%04hx, min_retry: %hums\r\n", _mountinfo.session, _mountinfo.server_version, _mountinfo.min_retry_ms);
@@ -119,6 +146,7 @@ success_is_true FileSystemTNFS::start(const char *host, uint16_t port, const cha
         tnfs_umount(&_mountinfo);
         _mountinfo.session = TNFS_INVALID_SESSION;
         _basepath[0] = '\0';
+        release_wss(_mountinfo);
         RETURN_ERROR_AS_FALSE();
     }
 
@@ -385,6 +413,25 @@ void keepAliveTNFS(void *info)
     Debug_println("Sending keep-alive command");
 #endif
     FileSystemTNFS *parent = (FileSystemTNFS *)info;
-    parent->exists("keep-alive");
+    parent->keep_alive();
+}
+
+// Runs in the esp_timer task, whose small stack cannot hold a TLS handshake. Over WSS the
+// keep-alive therefore only uses a connection that is already open; if it has dropped,
+// the next operation from the main loop reconnects.
+void FileSystemTNFS::keep_alive()
+{
+    tnfsStreamLink *link =
+        _mountinfo.protocol == TNFS_PROTOCOL_WS ? _mountinfo.stream_link.get() : nullptr;
+    if (link == nullptr)
+    {
+        exists("keep-alive"); // TCP and UDP: unchanged
+        return;
+    }
+    // Held across the whole keep-alive so no other task sees connecting disallowed.
+    std::lock_guard<std::recursive_mutex> lock(_mountinfo.transaction_mutex);
+    link->allow_connect(false);
+    exists("keep-alive");
+    link->allow_connect(true);
 }
 #endif

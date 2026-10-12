@@ -18,8 +18,75 @@
 #include "utils.h"
 
 #include "tnfslib_internal.h"
+#include "tnfslib_stream.h"
+#include "tnfslib_ws.h"
+
+#include <new>
 
 using namespace std;
+
+// TNFS over WSS (TNFS_PROTOCOL_WS). A TLS handshake on the ESP32 takes seconds, so
+// connecting gets more time than TNFS_TIMEOUT; a whole transaction, retries included,
+// is capped so the host computer is never stalled for TNFS_RETRIES full rounds.
+#define TNFS_WS_CONNECT_TIMEOUT 5000
+#define TNFS_WS_WRITE_TIMEOUT 2000      // whole request, partial writes included
+#define TNFS_WS_POLL_TIMEOUT 20         // one read while waiting for a reply
+#define TNFS_WS_TRANSACTION_BUDGET 8000 // no new attempt starts after this
+
+static uint32_t _tnfs_stream_millis() { return (uint32_t)fnSystem.millis(); }
+
+success_is_true tnfs_ws_attach(tnfsMountInfo *m_info)
+{
+    std::unique_ptr<tnfsStreamTransport> transport = tnfs_make_ws_transport();
+    if (!transport)
+        RETURN_ERROR_AS_FALSE();
+    m_info->stream_link.reset(
+        new (std::nothrow) tnfsStreamLink(std::move(transport), _tnfs_stream_millis));
+    RETURN_SUCCESS_IF(m_info->stream_link != nullptr);
+}
+
+// Never falls back to TCP or UDP: a WSS mount only ever talks WSS.
+static bool _tnfs_stream_send(tnfsMountInfo *m_info, tnfsPacket &pkt, uint16_t payload_size)
+{
+    if (!m_info->stream_link)
+        return false;
+    return m_info->stream_link->send(m_info->hostname, m_info->port, pkt.rawData,
+                                     payload_size + TNFS_HEADER_SIZE, TNFS_WS_CONNECT_TIMEOUT,
+                                     TNFS_WS_WRITE_TIMEOUT);
+}
+
+static int _tnfs_stream_recv(tnfsMountInfo *m_info, tnfsPacket &pkt)
+{
+    if (!m_info->stream_link)
+        return -1;
+    tnfsStreamReply r = m_info->stream_link->recv(pkt.rawData, TNFS_WS_POLL_TIMEOUT);
+    return r.status == tnfsStreamStatus::REPLY ? r.length : -1;
+}
+
+static bool _tnfs_stream_is_ws(tnfsMountInfo *m_info)
+{
+    return m_info->protocol == TNFS_PROTOCOL_WS && m_info->stream_link;
+}
+
+// Whether a WSS transaction must stop retrying: its time is up, or no request can go
+// out because the connection is down and reconnecting is not allowed here.
+static bool _tnfs_stream_give_up(tnfsMountInfo *m_info, uint32_t start)
+{
+    if (!_tnfs_stream_is_ws(m_info))
+        return false;
+    if (!m_info->stream_link->can_send())
+    {
+        Debug_println("TNFS WSS: no connection, and reconnecting is not allowed here");
+        return true;
+    }
+    if (_tnfs_stream_millis() - start >= TNFS_WS_TRANSACTION_BUDGET)
+    {
+        Debug_printf("TNFS WSS: giving up after %d ms\r\n", TNFS_WS_TRANSACTION_BUDGET);
+        return true;
+    }
+    return false;
+}
+
 // ------------------------------------------------
 // INTERNAL UTILITY FUNCTIONS
 // ------------------------------------------------
@@ -32,6 +99,9 @@ using namespace std;
 */
 bool _tnfs_send(fnUDP *udp, tnfsMountInfo *m_info, tnfsPacket &pkt, uint16_t payload_size)
 {
+    if (m_info->protocol == TNFS_PROTOCOL_WS)
+        return _tnfs_stream_send(m_info, pkt, payload_size);
+
     if (m_info->protocol == TNFS_PROTOCOL_UNKNOWN)
     {
         bool success = _tnfs_tcp_send(m_info, pkt, payload_size);
@@ -110,6 +180,9 @@ bool _tnfs_udp_do_send(fnUDP *udp, tnfsMountInfo *m_info, tnfsPacket &pkt, uint1
 */
 int _tnfs_recv(fnUDP *udp, tnfsMountInfo *m_info, tnfsPacket &pkt)
 {
+    if (m_info->protocol == TNFS_PROTOCOL_WS)
+        return _tnfs_stream_recv(m_info, pkt);
+
     if (m_info->protocol == TNFS_PROTOCOL_TCP || m_info->protocol == TNFS_PROTOCOL_UNKNOWN)
     {
         return _tnfs_tcp_recv(m_info, pkt);
@@ -173,12 +246,20 @@ bool _tnfs_transaction(tnfsMountInfo *m_info, tnfsPacket &pkt, uint16_t payload_
     // Set sequence number before the transaction loop
     reqPkt.sequence_num = m_info->current_sequence_num++;
 
+    uint32_t ws_start = _tnfs_stream_millis();
+
     // Start a new retry sequence
     for (int retry = 0; retry < m_info->max_retries; retry++)
     {
+        if (_tnfs_stream_give_up(m_info, ws_start))
+            break;
+
         switch(_tnfs_send_recv(udp, m_info, reqPkt, payload_size, pkt))
         {
             case SUCCESS:
+            // The session is over: release the WSS connection and its TLS memory.
+            if (reqPkt.command == TNFS_CMD_UNMOUNT && _tnfs_stream_is_ws(m_info))
+                m_info->stream_link->close();
             return true;
 
             case RESET:
@@ -190,6 +271,9 @@ bool _tnfs_transaction(tnfsMountInfo *m_info, tnfsPacket &pkt, uint16_t payload_
             // fallback to retry
             break;
         }
+
+        if (_tnfs_stream_give_up(m_info, ws_start))
+            break;
 
         // Make sure we wait before retrying
         fnSystem.delay(m_info->min_retry_ms);
@@ -250,6 +334,13 @@ _tnfs_send_recv_result _tnfs_send_recv(fnUDP &udp, tnfsMountInfo *m_info, tnfsPa
             break;
         }
 
+        // A dropped WSS connection cannot deliver the reply; retry (and reconnect) now.
+        if (_tnfs_stream_is_ws(m_info) && m_info->stream_link->exhausted())
+        {
+            Debug_println("TNFS WSS: connection lost while waiting for a reply");
+            return FAILED;
+        }
+
 #ifdef ESP_PLATFORM
         fnSystem.yield();
 #else
@@ -257,6 +348,10 @@ _tnfs_send_recv_result _tnfs_send_recv(fnUDP &udp, tnfsMountInfo *m_info, tnfsPa
 #endif
 
     } while ((fnSystem.millis() - ms_start) < m_info->timeout_ms); // packet receive loop
+
+    // A reply cut short must not prefix the next one on this connection.
+    if (_tnfs_stream_is_ws(m_info))
+        m_info->stream_link->expire();
 
     if (m_info->protocol == TNFS_PROTOCOL_UNKNOWN)
     {

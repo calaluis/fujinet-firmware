@@ -49,6 +49,9 @@ struct tnfsStreamReply
     int length; // reply length when REPLY, otherwise 0
 };
 
+// Monotonic milliseconds; wrap-around is handled with unsigned arithmetic.
+using tnfsMillisFn = uint32_t (*)();
+
 // One TNFS mount's stream connection and its reply reassembly. Owns the transport;
 // fixed memory (one tnfsReplyAssembler), no allocation, task or lock of its own.
 class tnfsStreamLink
@@ -57,7 +60,10 @@ public:
     // Largest request: header plus payload, the size of tnfsPacket::rawData.
     static constexpr int MAX_REQUEST_SIZE = TNFS_HEADER_SIZE + TNFS_PAYLOAD_SIZE;
 
-    explicit tnfsStreamLink(std::unique_ptr<tnfsStreamTransport> transport);
+    // With a clock, `write_timeout_ms` bounds the whole request, partial writes included;
+    // without one it bounds each transport write.
+    explicit tnfsStreamLink(std::unique_ptr<tnfsStreamTransport> transport,
+                            tnfsMillisFn now_ms = nullptr);
     ~tnfsStreamLink();
 
     tnfsStreamLink(const tnfsStreamLink &) = delete;
@@ -76,6 +82,19 @@ public:
     // Close the connection and drop buffered bytes. Idempotent.
     void close();
 
+    // The caller stopped waiting for a reply. A partial reply left in the buffer could
+    // misalign the next one (e.g. an EAGAIN sent without its back-off bytes), so it is
+    // dropped together with the connection; with nothing buffered the connection stays.
+    void expire();
+
+    // No reply can arrive any more until the next send reconnects.
+    bool exhausted() const { return !is_connected() && buffered() == 0; }
+
+    // With connecting disallowed, send() only uses a connection that is already open,
+    // e.g. from a task whose stack cannot hold a TLS handshake.
+    void allow_connect(bool allowed) { _connect_allowed = allowed; }
+    bool can_send() const { return is_connected() || (_transport && _connect_allowed); }
+
     bool is_connected() const;
     int buffered() const { return _rx.buffered(); }
 
@@ -83,6 +102,8 @@ private:
     tnfsStreamReply take_reply(uint8_t (&out)[TNFS_MAX_REPLY_SIZE]);
 
     std::unique_ptr<tnfsStreamTransport> _transport;
+    tnfsMillisFn _now_ms;
+    bool _connect_allowed = true;
     tnfsReplyAssembler _rx;
 };
 

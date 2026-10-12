@@ -2,6 +2,7 @@
 #define _TNFSLIB_MOUNTINFO_H
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 
 #include "fnDNS.h"
@@ -26,6 +27,9 @@
 #define TNFS_PROTOCOL_UNKNOWN 0
 #define TNFS_PROTOCOL_TCP 1
 #define TNFS_PROTOCOL_UDP 2
+#define TNFS_PROTOCOL_WS 3 // TNFS over a secure WebSocket ("_wss." host prefix); see tnfslib_ws.h
+
+#define TNFS_WS_DEFAULT_PORT 443
 
 #ifdef TNFS_UDP_SIMULATE_POOR_CONNECTION
 #define TNFS_UDP_SIMULATE_SEND_LOSS
@@ -67,6 +71,8 @@ struct tnfsDirCacheEntry
     char entryname[TNFS_MAX_FILELEN];
 };
 
+class tnfsStreamLink;
+
 // Everything we need to know about and keep track of for the server we're talking to
 class tnfsMountInfo
 {
@@ -80,7 +86,7 @@ private:
 public:
     ~tnfsMountInfo();
 
-    tnfsMountInfo(){};
+    tnfsMountInfo();
     tnfsMountInfo(const char *host_name, uint16_t host_port = TNFS_DEFAULT_PORT);
     tnfsMountInfo(in_addr_t host_address, uint16_t host_port = TNFS_DEFAULT_PORT);
 
@@ -100,6 +106,7 @@ public:
 
     uint8_t protocol = TNFS_PROTOCOL_UNKNOWN;
     fnTcpClient tcp_client;
+    std::unique_ptr<tnfsStreamLink> stream_link; // TNFS_PROTOCOL_WS only
 
     // These char[] sizes are abitrary...
     char hostname[64] = { '\0' };

@@ -2,6 +2,7 @@
 #define _TNFSLIB_H
 
 #include "tnfslibMountInfo.h"
+#include "global_types.h"
 
 
 #define TNFS_CMD_MOUNT 0x00
@@ -177,6 +178,10 @@ struct tnfsStat
 
 int tnfs_mount(tnfsMountInfo *m_info);
 int tnfs_umount(tnfsMountInfo *m_info);
+
+// Give a TNFS_PROTOCOL_WS mount its WSS connection (not yet connected). Fails where WSS
+// is unavailable, e.g. on PC builds.
+success_is_true tnfs_ws_attach(tnfsMountInfo *m_info);
 
 //int tnfs_opendir(tnfsMountInfo *m_info, const char *directory);
 int tnfs_opendirx(tnfsMountInfo *m_info, const char *directory, uint8_t sortopts = 0, uint8_t diropts = 0, const char *pattern = nullptr, uint16_t maxresults = 0);

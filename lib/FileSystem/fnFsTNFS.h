@@ -35,6 +35,9 @@ public:
 
     bool is_started();
     bool exists(const char* path) override;
+#ifdef ESP_PLATFORM
+    void keep_alive(); // called by the keep-alive timer
+#endif
 
     success_is_true remove(const char* path) override;
 

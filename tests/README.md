@@ -29,7 +29,8 @@ Host-side unit tests and policy checks for the FujiNet-PC build. ctest runs them
 | `CassetteFSKReadTests.cpp` | `lib/device/sio/cassetteFSKRead.cpp` over a fake remote file that loses its position (`cassettefskread_tests`) |
 | `FSKTestImages.h` | Synthetic A8CAS images, a fake file and an encoder oracle shared by the two FSK test files above |
 | `TnfsFramingTests.cpp` | `lib/TNFSlib/tnfslib_framing.cpp` reply lengths, split and coalesced streams, malformed input (`tnfs_framing_tests`) |
-| `TnfsStreamTests.cpp` | `lib/TNFSlib/tnfslib_stream.cpp` over a fake transport: connect, partial reads and writes, disconnects, timeouts, malformed replies, no allocation (`tnfs_stream_tests`) |
+| `TnfsStreamTests.cpp` | `lib/TNFSlib/tnfslib_stream.cpp` over a fake transport: connect, partial reads and writes, disconnects, timeouts, malformed replies, no allocation, write deadline (`tnfs_stream_tests`) |
+| `TnfsWsFramesTests.cpp` | `lib/TNFSlib/tnfslib_ws_frames.cpp`, then end to end through `tnfsStreamLink` over a simulation of ESP-IDF `esp_transport_ws` reads (`tnfs_ws_frames_tests`) |
 | `check_no_build_ifdefs.py` | Policy: no `BUILD_*` macro in a preprocessor conditional under `lib/device/fujiDevice`, `lib/device/fujiClock` or `lib/device/NDevice` (`no_build_ifdefs_in_fujidevice`) |
 | `check_no_system_bus.py` | Policy: `SYSTEM_BUS` must not appear in any source under `lib/media` (`no_system_bus_in_media`) |
 | `unsit.c`, `stuffit_test.sh` | Host CLI over `lib/stuffit` and a comparison against `unar` (`stuffit_sample_tests`; registered only with `SIT_SAMPLES_DIR`) |

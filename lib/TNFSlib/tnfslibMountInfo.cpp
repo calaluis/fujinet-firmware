@@ -1,8 +1,12 @@
 
 #include "tnfslibMountInfo.h"
+#include "tnfslib_stream.h"
 
 #include "compat_string.h"
 
+
+// Out of line so that stream_link's destructor sees the complete tnfsStreamLink.
+tnfsMountInfo::tnfsMountInfo() {}
 
 tnfsMountInfo::tnfsMountInfo(const char *host_name, uint16_t host_port)
 {

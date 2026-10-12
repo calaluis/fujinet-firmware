@@ -47,6 +47,10 @@ struct ReadEvent
     Bytes bytes;
 };
 
+// Fake monotonic clock for the write deadline.
+static uint32_t g_now = 0;
+static uint32_t fake_millis() { return g_now; }
+
 struct FakeState
 {
     std::deque<bool> connect_results; // empty: connect succeeds
@@ -54,6 +58,7 @@ struct FakeState
     int write_chunk = INT_MAX;        // most bytes accepted per write()
     int write_lost_after = -1;        // drop the connection once this many bytes were written
     bool write_stalls = false;        // write() makes no progress
+    uint32_t write_ms = 0;            // time each write() takes on the fake clock
 
     bool connected = false;
     int connects = 0, closes = 0, destroyed = 0, reads = 0, writes = 0;
@@ -92,6 +97,7 @@ public:
     {
         _s.writes++;
         _s.write_timeout = timeout_ms;
+        g_now += _s.write_ms;
         if (!_s.connected)
             return -1;
         if (_s.write_stalls)
@@ -665,5 +671,138 @@ TEST_CASE("send and recv allocate nothing and buffering stays within the assembl
     CHECK(replies == 3);
     CHECK(g_allocs == 0);
     CHECK(max_buffered <= tnfsReplyAssembler::CAPACITY);
-    CHECK(sizeof(tnfsStreamLink) <= sizeof(tnfsReplyAssembler) + 2 * sizeof(void *));
+    CHECK(sizeof(tnfsStreamLink) <= sizeof(tnfsReplyAssembler) + 3 * sizeof(void *));
+}
+
+// ---------------------------------------------------------------------------------------
+// Write deadline and timeout policy (P4)
+
+struct ClockRig
+{
+    FakeState s;
+    tnfsStreamLink link{std::unique_ptr<tnfsStreamTransport>(new FakeStreamTransport(s)),
+                        fake_millis};
+    uint8_t out[TNFS_MAX_REPLY_SIZE];
+
+    success_is_true send(const Bytes &req, int write_timeout_ms)
+    {
+        return link.send("h", 443, req.data(), static_cast<int>(req.size()), 6000,
+                         write_timeout_ms);
+    }
+};
+
+TEST_CASE("write deadline: partial writes share one budget")
+{
+    for (uint32_t origin : {0u, 1000u, 0xFFFFFFF0u}) // the last one wraps around
+    {
+        CAPTURE(origin);
+        g_now = origin;
+        ClockRig r;
+        r.s.write_chunk = 100;
+        r.s.write_ms = 300;
+        Bytes req(450, 0x11); // five writes of 300 ms each
+        CHECK(r.send(req, 2000));
+        CHECK(r.s.writes == 5);
+        CHECK(r.s.write_timeout == 2000 - 4 * 300); // each call gets what is left
+
+        // The same request against a 1,000 ms budget: the fourth call is never made.
+        g_now = origin;
+        ClockRig late;
+        late.s.write_chunk = 100;
+        late.s.write_ms = 300;
+        CHECK_FALSE(late.send(req, 1000));
+        CHECK(late.s.writes == 4);
+        CHECK(late.s.write_timeout == 100);
+        CHECK_FALSE(late.link.is_connected()); // a truncated request is never left behind
+        CHECK(late.s.written.size() == 400);
+    }
+}
+
+TEST_CASE("write deadline: a budget exhausted exactly fails before writing again")
+{
+    g_now = 0;
+    ClockRig r;
+    r.s.write_chunk = 1;
+    r.s.write_ms = 10;
+    CHECK_FALSE(r.send(Bytes(5, 0), 30));
+    CHECK(r.s.writes == 3);
+    CHECK(r.s.written.size() == 3);
+}
+
+TEST_CASE("write deadline: without a clock each write gets the full timeout")
+{
+    Rig r;
+    r.s.write_chunk = 2;
+    r.s.write_ms = 5000;
+    CHECK(r.send());
+    CHECK(r.s.write_timeout == 2000);
+    CHECK(r.s.written == REQUEST);
+}
+
+TEST_CASE("expire: drops a partial reply with its connection, keeps an idle one")
+{
+    g_now = 0;
+    ClockRig r;
+    REQUIRE(r.send(REQUEST, 2000));
+    int closes = r.s.closes; // send() closes once before connecting
+    r.link.expire();         // nothing buffered: keep the connection
+    CHECK(r.link.is_connected());
+    CHECK(r.s.closes == closes);
+
+    r.s.script.push_back({Ev::DATA, Bytes(STAT_OK.begin(), STAT_OK.begin() + 9)});
+    REQUIRE(r.link.recv(r.out, 20).status == tnfsStreamStatus::PENDING);
+    r.link.expire();
+    CHECK_FALSE(r.link.is_connected());
+    CHECK(r.link.buffered() == 0);
+
+    // The retry reconnects; the stale 9 bytes cannot prefix the new reply.
+    REQUIRE(r.send(REQUEST, 2000));
+    CHECK(r.s.connects == 2);
+    r.s.script.push_back({Ev::DATA, STAT_OK});
+    tnfsStreamReply rep = r.link.recv(r.out, 20);
+    REQUIRE(rep.status == tnfsStreamStatus::REPLY);
+    CHECK(Bytes(r.out, r.out + rep.length) == STAT_OK);
+}
+
+TEST_CASE("exhausted: only when disconnected with nothing left to deliver")
+{
+    Rig r;
+    CHECK(r.link.exhausted());
+    REQUIRE(r.send());
+    CHECK_FALSE(r.link.exhausted());
+    r.s.script.push_back({Ev::DATA, cat({MOUNT_OK, UMOUNT_OK})});
+    r.expect_reply(MOUNT_OK);
+    r.s.connected = false; // dropped, but one reply is still buffered
+    CHECK_FALSE(r.link.exhausted());
+    r.expect_reply(UMOUNT_OK);
+    CHECK(r.link.exhausted());
+}
+
+TEST_CASE("allow_connect(false): only an open connection is used")
+{
+    Rig r;
+    r.link.allow_connect(false);
+    CHECK_FALSE(r.link.can_send());
+    CHECK_FALSE(r.send()); // would need a new connection
+    CHECK(r.s.connects == 0);
+    CHECK(r.s.writes == 0);
+
+    r.link.allow_connect(true);
+    CHECK(r.link.can_send());
+    REQUIRE(r.send());
+    r.link.allow_connect(false);
+    CHECK(r.link.can_send());
+    CHECK(r.send()); // the open connection is reused
+    CHECK(r.s.connects == 1);
+
+    r.s.connected = false; // dropped: no reconnect while disallowed
+    CHECK_FALSE(r.link.can_send());
+    CHECK_FALSE(r.send());
+    CHECK(r.s.connects == 1);
+}
+
+TEST_CASE("can_send is false without a transport")
+{
+    tnfsStreamLink link(nullptr);
+    CHECK_FALSE(link.can_send());
 }

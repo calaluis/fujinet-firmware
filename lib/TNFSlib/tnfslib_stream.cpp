@@ -2,8 +2,9 @@
 
 #include <utility>
 
-tnfsStreamLink::tnfsStreamLink(std::unique_ptr<tnfsStreamTransport> transport)
-    : _transport(std::move(transport))
+tnfsStreamLink::tnfsStreamLink(std::unique_ptr<tnfsStreamTransport> transport,
+                               tnfsMillisFn now_ms)
+    : _transport(std::move(transport)), _now_ms(now_ms)
 {
 }
 
@@ -18,6 +19,12 @@ void tnfsStreamLink::close()
     _rx.reset();
 }
 
+void tnfsStreamLink::expire()
+{
+    if (_rx.buffered() > 0)
+        close();
+}
+
 success_is_true tnfsStreamLink::send(const char *host, uint16_t port, const uint8_t *request,
                                      int len, int connect_timeout_ms, int write_timeout_ms)
 {
@@ -26,6 +33,8 @@ success_is_true tnfsStreamLink::send(const char *host, uint16_t port, const uint
 
     if (!_transport->is_connected())
     {
+        if (!_connect_allowed)
+            RETURN_ERROR_AS_FALSE();
         // Whatever is buffered belongs to the previous connection.
         close();
         if (!_transport->connect(host, port, connect_timeout_ms))
@@ -35,11 +44,24 @@ success_is_true tnfsStreamLink::send(const char *host, uint16_t port, const uint
         }
     }
 
-    // Each call either makes progress or fails, so this loop runs at most `len` times.
+    // Each call either makes progress or fails, so this loop runs at most `len` times;
+    // with a clock, the calls share one budget.
+    uint32_t start = _now_ms ? _now_ms() : 0;
     int sent = 0;
     while (sent < len)
     {
-        int n = _transport->write(request + sent, len - sent, write_timeout_ms);
+        int budget = write_timeout_ms;
+        if (_now_ms)
+        {
+            uint32_t spent = _now_ms() - start;
+            if (spent >= static_cast<uint32_t>(write_timeout_ms))
+            {
+                close();
+                RETURN_ERROR_AS_FALSE();
+            }
+            budget = write_timeout_ms - static_cast<int>(spent);
+        }
+        int n = _transport->write(request + sent, len - sent, budget);
         if (n <= 0 || n > len - sent)
         {
             close();
