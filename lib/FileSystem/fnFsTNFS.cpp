@@ -14,11 +14,16 @@
 #include "fnSystem.h"
 #include "fnDNS.h"
 #include "tnfslib.h"
+#include "tnfslib_host.h"
+#include "tnfslib_keepalive.h"
 #include "tnfslib_stream.h"
 #include "compat_string.h"
 #include "../../include/debug.h"
 
 FileSystemTNFS fnTNFS;
+
+// WSS mounts whose keep-alive is due, handed from the esp_timer task to the main loop.
+static tnfsKeepAliveQueue wss_keep_alives;
 
 // A failed "_wss." mount frees its connection and does not leave the protocol behind.
 static void release_wss(tnfsMountInfo &m_info)
@@ -36,6 +41,9 @@ FileSystemTNFS::FileSystemTNFS()
 
 FileSystemTNFS::~FileSystemTNFS()
 {
+    // First, so the main loop never services a mount that is going away (waits for a
+    // keep-alive in progress).
+    wss_keep_alives.remove(this);
     if (_started)
         tnfs_umount(&_mountinfo);
 #ifdef ESP_PLATFORM
@@ -56,37 +64,15 @@ success_is_true FileSystemTNFS::start(const char *host, uint16_t port, const cha
     if (_started)
         RETURN_SUCCESS_AS_TRUE();
 
-    if(host == nullptr)
+    // "_tcp.", "_udp." or "_wss." (TNFS over wss://host/) force a transport. Validate
+    // before touching the mount, so a bad name leaves no protocol behind.
+    tnfsHostSpec spec = tnfs_parse_host(host, port);
+    if (!spec.valid)
         RETURN_ERROR_AS_FALSE();
-
-    const char *host_no_prefix;
-    if (strncmp("_tcp.", host, 5) == 0)
-    {
-        host_no_prefix = &host[5];
-        _mountinfo.protocol = TNFS_PROTOCOL_TCP;
-    }
-    else if (strncmp("_udp.", host, 5) == 0)
-    {
-        host_no_prefix = &host[5];
-        _mountinfo.protocol = TNFS_PROTOCOL_UDP;
-    }
-    else if (strncmp("_wss.", host, 5) == 0)
-    {
-        // TNFS over wss://host/, e.g. a TNFS server published through a WebSocket bridge
-        host_no_prefix = &host[5];
-        _mountinfo.protocol = TNFS_PROTOCOL_WS;
-        if (port == TNFS_DEFAULT_PORT)
-            port = TNFS_WS_DEFAULT_PORT;
-    }
-    else
-    {
-        host_no_prefix = host;
-    }
-    if (host_no_prefix[0] == '\0')
-    {
-            RETURN_ERROR_AS_FALSE();
-    }
-    strlcpy(_mountinfo.hostname, host_no_prefix, sizeof(_mountinfo.hostname));
+    if (spec.forced)
+        _mountinfo.protocol = spec.protocol;
+    port = spec.port;
+    strlcpy(_mountinfo.hostname, spec.host, sizeof(_mountinfo.hostname));
 
     // Try to resolve the hostname and store that so we don't have to keep looking it up
     _mountinfo.host_ip = get_ip4_addr_by_name(_mountinfo.hostname);
@@ -157,6 +143,10 @@ success_is_true FileSystemTNFS::start(const char *host, uint16_t port, const cha
         .name = "tnfs_keep_alive",
         .skip_unhandled_events = true,
     };
+    // WSS keep-alives run in the main loop (FileSystemTNFS::service_keep_alives): the
+    // timer only marks them due.
+    if (_mountinfo.protocol == TNFS_PROTOCOL_WS && !wss_keep_alives.add(this))
+        Debug_println("TNFS WSS: no keep-alive slot, the session may expire when idle");
     if (esp_timer_create(&tcfg, &keepAliveTimerHandle) == ESP_OK)
         // Send a keep-alive message every 60s.
         esp_timer_start_periodic(keepAliveTimerHandle, 60 * 1000000);
@@ -416,22 +406,25 @@ void keepAliveTNFS(void *info)
     parent->keep_alive();
 }
 
-// Runs in the esp_timer task, whose small stack cannot hold a TLS handshake. Over WSS the
-// keep-alive therefore only uses a connection that is already open; if it has dropped,
-// the next operation from the main loop reconnects.
+// Runs in the esp_timer task, whose 3.5 KB stack must not carry TLS or wait on the
+// network. A WSS keep-alive is only marked due here and runs in the main loop.
 void FileSystemTNFS::keep_alive()
 {
-    tnfsStreamLink *link =
-        _mountinfo.protocol == TNFS_PROTOCOL_WS ? _mountinfo.stream_link.get() : nullptr;
-    if (link == nullptr)
+    if (_mountinfo.protocol == TNFS_PROTOCOL_WS && _mountinfo.stream_link)
     {
-        exists("keep-alive"); // TCP and UDP: unchanged
+        wss_keep_alives.mark_due(this);
         return;
     }
-    // Held across the whole keep-alive so no other task sees connecting disallowed.
-    std::lock_guard<std::recursive_mutex> lock(_mountinfo.transaction_mutex);
-    link->allow_connect(false);
-    exists("keep-alive");
-    link->allow_connect(true);
+    exists("keep-alive"); // TCP and UDP: unchanged
 }
 #endif
+
+void FileSystemTNFS::service_keep_alives()
+{
+    // A single bounded attempt per due mount, over its open connection (tnfs_ws_keepalive).
+    wss_keep_alives.service([](void *client) {
+        static_cast<FileSystemTNFS *>(client)->wss_keep_alive();
+    });
+}
+
+void FileSystemTNFS::wss_keep_alive() { tnfs_ws_keepalive(&_mountinfo); }

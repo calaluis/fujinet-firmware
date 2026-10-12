@@ -183,6 +183,11 @@ int tnfs_umount(tnfsMountInfo *m_info);
 // is unavailable, e.g. on PC builds.
 success_is_true tnfs_ws_attach(tnfsMountInfo *m_info);
 
+// One bounded keep-alive for a TNFS_PROTOCOL_WS mount, for a task with a large stack
+// (not a timer callback): a single short attempt over the open connection, never a
+// reconnect; skipped (-1) when another task is in a transaction. Returns the TNFS result.
+int tnfs_ws_keepalive(tnfsMountInfo *m_info);
+
 //int tnfs_opendir(tnfsMountInfo *m_info, const char *directory);
 int tnfs_opendirx(tnfsMountInfo *m_info, const char *directory, uint8_t sortopts = 0, uint8_t diropts = 0, const char *pattern = nullptr, uint16_t maxresults = 0);
 //int tnfs_readdir(tnfsMountInfo *m_info, char *dir_entry, int dir_entry_len);

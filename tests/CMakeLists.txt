@@ -499,6 +499,7 @@ add_test(NAME tnfs_stream_tests COMMAND tnfs_stream_tests)
 add_executable(tnfs_ws_frames_tests
     TnfsWsFramesTests.cpp
     ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_ws_frames.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_ws_transport.cpp
     ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_stream.cpp
     ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_framing.cpp
 )
@@ -511,7 +512,68 @@ target_include_directories(tnfs_ws_frames_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/components_pc/   # doctest
 )
 
+# UNIT_TESTS: the adapter logs through debug.h, which is silent with it.
+target_compile_definitions(tnfs_ws_frames_tests PRIVATE UNIT_TESTS)
+
 add_test(NAME tnfs_ws_frames_tests COMMAND tnfs_ws_frames_tests)
+
+# ------------------------------------------------------------------------------
+# TNFS over WSS, transaction level: the real lib/TNFSlib transaction, mount, stat
+# and keep-alive code over a fake TNFS server on a virtual clock. tnfs_harness/
+# replaces the bus, the clock and the TCP/UDP clients, so it must come first on
+# the include path; lib/tcpip, lib/hardware, lib/bus and lib/utils must not be on it.
+# ------------------------------------------------------------------------------
+find_package(Threads REQUIRED)
+
+add_executable(tnfs_ws_transaction_tests
+    TnfsWsTransactionTests.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_dir.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_transport.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_codes.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslibMountInfo.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_stream.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_framing.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_ws.cpp
+)
+
+target_include_directories(tnfs_ws_transaction_tests BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/tests/tnfs_harness/
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/
+    ${CMAKE_SOURCE_DIR}/lib/compat/
+    ${CMAKE_SOURCE_DIR}/include/
+    ${CMAKE_SOURCE_DIR}/components_pc/
+)
+
+target_compile_definitions(tnfs_ws_transaction_tests PRIVATE UNIT_TESTS)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  target_sources(tnfs_ws_transaction_tests PRIVATE ${CMAKE_SOURCE_DIR}/lib/compat/strlcpy.c)
+endif()
+target_link_libraries(tnfs_ws_transaction_tests PRIVATE Threads::Threads)
+
+add_test(NAME tnfs_ws_transaction_tests COMMAND tnfs_ws_transaction_tests)
+
+# ------------------------------------------------------------------------------
+# WSS keep-alive hand-off (lib/TNFSlib/tnfslib_keepalive.cpp) and host-slot
+# prefixes (lib/TNFSlib/tnfslib_host.cpp).
+# ------------------------------------------------------------------------------
+add_executable(tnfs_keepalive_tests
+    TnfsKeepAliveTests.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_keepalive.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_host.cpp
+)
+
+target_include_directories(tnfs_keepalive_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/
+    ${CMAKE_SOURCE_DIR}/lib/tcpip/       # tnfslibMountInfo.h
+    ${CMAKE_SOURCE_DIR}/lib/compat/
+    ${CMAKE_SOURCE_DIR}/include/
+    ${CMAKE_SOURCE_DIR}/components_pc/   # doctest
+)
+
+target_link_libraries(tnfs_keepalive_tests PRIVATE Threads::Threads)
+
+add_test(NAME tnfs_keepalive_tests COMMAND tnfs_keepalive_tests)
 
 # ------------------------------------------------------------------------------
 # lib/stuffit: unsit is a host CLI over the library. The sample tests compare

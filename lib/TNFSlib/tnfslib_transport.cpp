@@ -32,6 +32,7 @@ using namespace std;
 #define TNFS_WS_WRITE_TIMEOUT 2000      // whole request, partial writes included
 #define TNFS_WS_POLL_TIMEOUT 20         // one read while waiting for a reply
 #define TNFS_WS_TRANSACTION_BUDGET 8000 // no new attempt starts after this
+#define TNFS_WS_KEEPALIVE_TIMEOUT 1500  // reply wait of the single keep-alive attempt
 
 static uint32_t _tnfs_stream_millis() { return (uint32_t)fnSystem.millis(); }
 
@@ -85,6 +86,36 @@ static bool _tnfs_stream_give_up(tnfsMountInfo *m_info, uint32_t start)
         return true;
     }
     return false;
+}
+
+int tnfs_ws_keepalive(tnfsMountInfo *m_info)
+{
+    if (m_info == nullptr || !_tnfs_stream_is_ws(m_info))
+        return -1;
+    // A transaction running in another task keeps the session alive anyway; never wait.
+    std::unique_lock<std::recursive_mutex> lock(m_info->transaction_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+        return -1;
+
+    // One short attempt over the open connection only: no reconnect (an idle drop is
+    // repaired by the next real operation), no retry delay.
+    // The transaction sleeps min_retry_ms after every failed attempt, the last one too.
+    uint8_t retries = m_info->max_retries;
+    int timeout = m_info->timeout_ms;
+    uint16_t retry_delay = m_info->min_retry_ms;
+    m_info->max_retries = 1;
+    m_info->timeout_ms = TNFS_WS_KEEPALIVE_TIMEOUT;
+    m_info->min_retry_ms = 0;
+    m_info->stream_link->allow_connect(false);
+
+    tnfsStat st;
+    int result = tnfs_stat(m_info, &st, "keep-alive");
+
+    m_info->stream_link->allow_connect(true);
+    m_info->min_retry_ms = retry_delay;
+    m_info->timeout_ms = timeout;
+    m_info->max_retries = retries;
+    return result;
 }
 
 // ------------------------------------------------

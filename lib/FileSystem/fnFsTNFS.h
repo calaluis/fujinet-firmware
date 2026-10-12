@@ -19,6 +19,8 @@ private:
 #endif
     char _current_dirpath[TNFS_MAX_FILELEN];
 
+    void wss_keep_alive();
+
 public:
     FileSystemTNFS();
     ~FileSystemTNFS();
@@ -38,6 +40,8 @@ public:
 #ifdef ESP_PLATFORM
     void keep_alive(); // called by the keep-alive timer
 #endif
+    // Run the WSS keep-alives the timer marked due; called from the main service loop.
+    static void service_keep_alives();
 
     success_is_true remove(const char* path) override;
 

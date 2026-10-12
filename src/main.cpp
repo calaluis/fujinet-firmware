@@ -33,6 +33,7 @@
 
 #include "fsFlash.h"
 #include "fnFsSD.h"
+#include "fnFsTNFS.h"
 
 #include "fnLedStrip.h"
 
@@ -619,6 +620,9 @@ void fn_service_loop(void *param)
 #endif
 
 #ifdef ESP_PLATFORM
+        // WSS keep-alives the esp_timer task marked due: network I/O belongs here, not there.
+        FileSystemTNFS::service_keep_alives();
+
         taskYIELD(); // Allow other tasks to run
 #else
 // !ESP_PLATFORM

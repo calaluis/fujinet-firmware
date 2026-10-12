@@ -8,6 +8,7 @@
 
 #include "tnfslib_stream.h"
 #include "tnfslib_ws_frames.h"
+#include "tnfslib_ws_transport.h"
 
 using Bytes = std::vector<uint8_t>;
 using T = tnfsWsFrameTracker;
@@ -135,9 +136,9 @@ TEST_CASE("frame tracker: an error resets every state")
 }
 
 // ---------------------------------------------------------------------------------------
-// End to end on PC: tnfsStreamLink -> a transport mapping tracker actions exactly as the
-// ESP adapter does -> a simulation of ESP-IDF 5.4.0 esp_transport_ws reads with control
-// frames propagated (transport_ws.c: ws_read, ws_read_header, ws_read_payload).
+// End to end on PC: tnfsStreamLink -> tnfsWsTransport (the real adapter) -> SimIo, a
+// tnfsWsIo simulating ESP-IDF 5.4.0 esp_transport_ws with control frames propagated
+// (transport_ws.c: ws_read, ws_read_header, ws_read_payload, _ws_write).
 
 // Server-to-client frame (unmasked).
 static Bytes frame(int opcode, const Bytes &payload, bool fin = true)
@@ -197,12 +198,35 @@ struct Net
     }
 };
 
-class SimEspWs
+struct WsLog
+{
+    int connects = 0, shutdowns = 0, frames_sent = 0, close_frames = 0;
+    std::vector<Bytes> requests; // unmasked payloads of BINARY frames
+    std::vector<Bytes> pongs;    // unmasked payloads of PONG frames
+    std::vector<int> send_timeouts;
+    // Behaviour of the next send() of each kind; true makes it fail.
+    bool fail_open = false;
+    bool fail_binary = false;
+    bool pong_backpressure = false; // send returns 0: the socket never became writable
+    bool fail_pong = false;         // send returns -1
+};
+
+// tnfsWsIo over a simulation of ESP-IDF 5.4.0 esp_transport_ws with control frames
+// propagated (transport_ws.c: ws_read, ws_read_header, ws_read_payload, _ws_write).
+class SimIo : public tnfsWsIo
 {
 public:
-    explicit SimEspWs(Net &net) : _net(net) {}
+    SimIo(Net &net, WsLog &log) : _net(net), _log(log) {}
 
-    int read(uint8_t *buf, int len)
+    bool open(const char *, uint16_t, int) override
+    {
+        _log.connects++;
+        _bytes_remaining = 0;
+        _header_received = false;
+        return !_log.fail_open;
+    }
+
+    int read(uint8_t *buf, int len, int) override
     {
         if (_bytes_remaining <= 0)
         {
@@ -241,105 +265,50 @@ public:
         return n;
     }
 
-    int opcode() const { return _header_received ? _opcode : T::NO_FRAME; }
-    int payload_len() const { return _payload_len; }
-    bool fin() const { return _fin; }
+    int opcode() const override { return _header_received ? _opcode : T::NO_FRAME; }
+    int payload_len() const override { return _payload_len; }
+    bool fin() const override { return _fin; }
+
+    int send(int opcode, uint8_t *payload, int len, int timeout_ms) override
+    {
+        _log.send_timeouts.push_back(timeout_ms);
+        Bytes plain(payload, payload + len);
+        // Like _ws_write: the payload is masked in place while it is sent.
+        for (int i = 0; i < len; i++)
+            payload[i] ^= 0x5A;
+        switch (opcode)
+        {
+        case T::OP_BINARY:
+            if (_log.fail_binary)
+                return -1;
+            _log.frames_sent++;
+            _log.requests.push_back(plain);
+            return len;
+        case T::OP_PONG:
+            if (_log.pong_backpressure)
+                return 0;
+            if (_log.fail_pong)
+                return -1;
+            _log.pongs.push_back(plain);
+            return len;
+        case T::OP_CLOSE:
+            _log.close_frames++;
+            return len;
+        default:
+            return -1;
+        }
+    }
+
+    void shutdown() override { _log.shutdowns++; }
 
 private:
     Net &_net;
+    WsLog &_log;
     int _bytes_remaining = 0;
     bool _header_received = false;
     int _opcode = 0;
     int _payload_len = 0;
     bool _fin = false;
-};
-
-struct WsLog
-{
-    int connects = 0, closes = 0, frames_sent = 0;
-    std::vector<Bytes> pongs;
-    bool server_closed = false;
-};
-
-// Same mapping as tnfsWsTransport::read/write in tnfslib_ws.cpp.
-class SimWsTransport : public tnfsStreamTransport
-{
-public:
-    SimWsTransport(Net &net, WsLog &log) : _net(net), _log(log) {}
-
-    success_is_true connect(const char *, uint16_t, int) override
-    {
-        _log.connects++;
-        _ws.reset(new SimEspWs(_net));
-        _frames.reset();
-        _connected = true;
-        return success_is_true(true);
-    }
-    bool is_connected() const override { return _connected; }
-    int write(const uint8_t *, int len, int) override
-    {
-        if (!_connected || len <= 0)
-            return -1;
-        _log.frames_sent++; // one request, one frame
-        return len;
-    }
-    int read(uint8_t *buf, int max, int) override
-    {
-        if (!_connected || max <= 0)
-            return drop();
-        int n = _ws->read(buf, max);
-        A action = _frames.on_read(n, _ws->opcode(), _ws->payload_len(), _ws->fin());
-        switch (action)
-        {
-        case A::DATA:
-            return n;
-        case A::IDLE:
-            _ctrl.clear();
-            return 0;
-        case A::LOST:
-            return drop();
-        default:
-            break;
-        }
-        // Control payload, possibly in parts.
-        if (static_cast<int>(_ctrl.size()) + n > T::MAX_CONTROL_PAYLOAD)
-            return drop();
-        _ctrl.insert(_ctrl.end(), buf, buf + n);
-        switch (action)
-        {
-        case A::CONTROL_PART:
-            return 0;
-        case A::PONG:
-            _log.pongs.push_back(_ctrl);
-            _ctrl.clear();
-            return 0;
-        case A::CLOSE:
-        default:
-            _log.server_closed = true;
-            return drop();
-        }
-    }
-    void close() override
-    {
-        if (_connected)
-            _log.closes++;
-        _connected = false;
-        _frames.reset();
-        _ctrl.clear();
-    }
-
-private:
-    int drop()
-    {
-        close();
-        return -1;
-    }
-    Net &_net;
-    WsLog &_log;
-    std::unique_ptr<SimEspWs> _ws;
-    T _frames;
-    Bytes _ctrl;
-    bool _connected = false;
 };
 
 // TNFS fixtures (session 0xBEEF).
@@ -374,7 +343,8 @@ struct WsRig
 {
     Net net;
     WsLog log;
-    tnfsStreamLink link{std::unique_ptr<tnfsStreamTransport>(new SimWsTransport(net, log))};
+    tnfsStreamLink link{std::unique_ptr<tnfsStreamTransport>(
+        new tnfsWsTransport(std::unique_ptr<tnfsWsIo>(new SimIo(net, log))))};
     uint8_t out[TNFS_MAX_REPLY_SIZE];
 
     success_is_true send()
@@ -512,7 +482,8 @@ TEST_CASE("ws end to end: server CLOSE ends the connection; nothing after it is 
     r.net.push(frame(T::OP_CLOSE, {0x03, 0xE8}));
     r.net.push(frame(T::OP_BINARY, slice(STAT_OK, 10, 27)));
     CHECK(r.poll().status == tnfsStreamStatus::DISCONNECTED);
-    CHECK(r.log.server_closed);
+    CHECK(r.log.close_frames == 1); // our CLOSE answers the server's
+    CHECK(r.log.shutdowns >= 1);
     CHECK(r.link.buffered() == 0); // the 10-byte fragment is dropped
 }
 
@@ -574,4 +545,137 @@ TEST_CASE("ws end to end: random frames, fragments, pings and segmentation")
         CHECK(r.link.buffered() == 0);
         CHECK(r.link.is_connected());
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// tnfsWsTransport itself (P4.1): control-frame write budget, masking, cleanup
+
+TEST_CASE("PONG gets its own write budget, not the 20 ms read poll that carried the PING")
+{
+    WsRig r;
+    REQUIRE(r.send());
+    r.log.send_timeouts.clear();
+    r.net.push(frame(T::OP_PING, {7, 8, 9}));
+    r.net.push(frame(T::OP_BINARY, STAT_OK));
+    r.expect(STAT_OK);
+    REQUIRE(r.log.pongs.size() == 1);
+    CHECK(r.log.pongs[0] == (Bytes{7, 8, 9}));
+    REQUIRE(r.log.send_timeouts.size() == 1);
+    CHECK(r.log.send_timeouts[0] == tnfsWsTransport::CONTROL_WRITE_TIMEOUT_MS);
+    CHECK(r.link.is_connected());
+}
+
+TEST_CASE("a fragmented PING is answered once, whole, within the control budget")
+{
+    WsRig r;
+    REQUIRE(r.send());
+    r.log.send_timeouts.clear();
+    Bytes payload(125, 0x33);
+    Bytes ping = frame(T::OP_PING, payload);
+    r.net.push(slice(ping, 0, 3));
+    r.net.push(slice(ping, 3, 60));
+    r.net.push(cat_bytes(slice(ping, 60, ping.size()), frame(T::OP_BINARY, STAT_OK)));
+    r.expect(STAT_OK);
+    REQUIRE(r.log.pongs.size() == 1);
+    CHECK(r.log.pongs[0] == payload);
+    CHECK(r.log.send_timeouts == std::vector<int>{tnfsWsTransport::CONTROL_WRITE_TIMEOUT_MS});
+}
+
+TEST_CASE("PONG under TCP back-pressure or failing: dropped cleanly, no CLOSE mid-stream")
+{
+    for (int mode = 0; mode < 2; mode++)
+    {
+        CAPTURE(mode);
+        WsRig r;
+        REQUIRE(r.send());
+        r.log.pong_backpressure = mode == 0; // send returns 0
+        r.log.fail_pong = mode == 1;         // send returns -1
+        int shutdowns = r.log.shutdowns;
+        r.net.push(frame(T::OP_PING, {1, 2}));
+        r.net.push(frame(T::OP_BINARY, slice(STAT_OK, 0, 10)));
+        CHECK(r.poll().status == tnfsStreamStatus::DISCONNECTED);
+        CHECK_FALSE(r.link.is_connected());
+        CHECK(r.link.buffered() == 0);
+        CHECK(r.log.close_frames == 0);     // aborted, not a closing handshake
+        CHECK(r.log.shutdowns > shutdowns); // shut down (idempotently, by adapter and link)
+
+        // The next request reconnects and works.
+        r.log.pong_backpressure = r.log.fail_pong = false;
+        r.net.runs.clear();
+        REQUIRE(r.send());
+        CHECK(r.log.connects == 2);
+        r.net.push(frame(T::OP_BINARY, STAT_OK));
+        r.expect(STAT_OK);
+    }
+}
+
+TEST_CASE("masking never touches the caller's request, also across a failed send and retry")
+{
+    WsRig r;
+    const Bytes original = REQUEST;
+    Bytes request = REQUEST;
+    r.log.fail_binary = true;
+    CHECK_FALSE(
+        r.link.send("h", 443, request.data(), static_cast<int>(request.size()), 5000, 2000));
+    CHECK(request == original);
+    CHECK_FALSE(r.link.is_connected());
+
+    r.log.fail_binary = false;
+    REQUIRE(
+        r.link.send("h", 443, request.data(), static_cast<int>(request.size()), 5000, 2000));
+    CHECK(request == original);
+    REQUIRE(r.log.requests.size() == 1);
+    CHECK(r.log.requests[0] == original); // the frame carried the unmasked bytes
+    CHECK(r.log.connects == 2);
+}
+
+TEST_CASE("a request frame gets a third of the write budget per ESP-IDF step")
+{
+    WsRig r;
+    REQUIRE(r.send());
+    REQUIRE(r.log.send_timeouts.size() == 1);
+    CHECK(r.log.send_timeouts[0] == 2000 / tnfsWsTransport::WRITE_STEPS);
+}
+
+TEST_CASE("a failed open is shut down and never sends a frame")
+{
+    WsRig r;
+    r.log.fail_open = true;
+    CHECK_FALSE(r.send());
+    CHECK(r.log.frames_sent == 0);
+    CHECK(r.log.close_frames == 0);
+    CHECK(r.log.shutdowns >= 1);
+    CHECK_FALSE(r.link.is_connected());
+}
+
+TEST_CASE("a clean close sends one CLOSE; closing again or destroying sends none")
+{
+    Net net;
+    WsLog log;
+    {
+        tnfsStreamLink link(std::unique_ptr<tnfsStreamTransport>(
+            new tnfsWsTransport(std::unique_ptr<tnfsWsIo>(new SimIo(net, log)))));
+        REQUIRE(
+            link.send("h", 443, REQUEST.data(), static_cast<int>(REQUEST.size()), 5000, 2000));
+        link.close();
+        CHECK(log.close_frames == 1);
+        link.close();
+        CHECK(log.close_frames == 1);
+    }
+    CHECK(log.close_frames == 1);
+    CHECK(log.shutdowns >= 3); // explicit closes plus destruction, all idempotent
+}
+
+TEST_CASE("destroying an open link closes it cleanly")
+{
+    Net net;
+    WsLog log;
+    {
+        tnfsStreamLink link(std::unique_ptr<tnfsStreamTransport>(
+            new tnfsWsTransport(std::unique_ptr<tnfsWsIo>(new SimIo(net, log)))));
+        REQUIRE(
+            link.send("h", 443, REQUEST.data(), static_cast<int>(REQUEST.size()), 5000, 2000));
+    }
+    CHECK(log.close_frames == 1);
+    CHECK(log.shutdowns >= 1);
 }
