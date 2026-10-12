@@ -473,6 +473,26 @@ target_include_directories(tnfs_framing_tests PRIVATE
 add_test(NAME tnfs_framing_tests COMMAND tnfs_framing_tests)
 
 # ------------------------------------------------------------------------------
+# TNFS stream link (lib/TNFSlib/tnfslib_stream.cpp) over a fake transport:
+# connect, partial reads and writes, disconnects, timeouts, malformed replies.
+# ------------------------------------------------------------------------------
+add_executable(tnfs_stream_tests
+    TnfsStreamTests.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_stream.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_framing.cpp
+)
+
+target_include_directories(tnfs_stream_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/
+    ${CMAKE_SOURCE_DIR}/lib/tcpip/       # tnfslib.h -> tnfslibMountInfo.h
+    ${CMAKE_SOURCE_DIR}/lib/compat/
+    ${CMAKE_SOURCE_DIR}/include/         # global_types.h
+    ${CMAKE_SOURCE_DIR}/components_pc/   # doctest
+)
+
+add_test(NAME tnfs_stream_tests COMMAND tnfs_stream_tests)
+
+# ------------------------------------------------------------------------------
 # lib/stuffit: unsit is a host CLI over the library. The sample tests compare
 # it against unar and ndif2raw; they need -DSIT_SAMPLES_DIR / -DNDIF2RAW_DIR
 # (or the same environment variables) and are skipped otherwise.

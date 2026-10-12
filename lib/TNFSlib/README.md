@@ -11,6 +11,7 @@ beginning.
 | `tnfslibMountInfo.h`, `tnfslibMountInfo.cpp` | `tnfsMountInfo` (host, session, `TNFS_PROTOCOL_TCP` or `TNFS_PROTOCOL_UDP`, open handles, directory cache) and `tnfsStat` |
 | `tnfslib_udp.h`, `tnfslib_udp_testing.cpp` | the UDP send and receive hooks, with a replacement that simulates packet loss and duplication when `TNFS_UDP_SIMULATE_POOR_CONNECTION` is defined |
 | `tnfslib_framing.h`, `tnfslib_framing.cpp` | `tnfs_frame_reply` and `tnfsReplyAssembler`: finds where each reply ends in a byte stream (TNFS has no length field). Not yet used by the TCP receive path |
+| `tnfslib_stream.h`, `tnfslib_stream.cpp` | `tnfsStreamTransport`, the port a byte-stream transport implements, and `tnfsStreamLink`, which writes whole requests and cuts replies out of that stream. No transport implements it yet and no mount uses it |
 
 ## How it fits
 - `FileSystemTNFS` in [lib/FileSystem/](../FileSystem/) is the main consumer (host slots and the
