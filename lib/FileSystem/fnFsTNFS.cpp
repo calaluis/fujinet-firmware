@@ -14,16 +14,26 @@
 #include "fnSystem.h"
 #include "fnDNS.h"
 #include "tnfslib.h"
+#include "tnfslib_callback_gate.h"
 #include "tnfslib_host.h"
 #include "tnfslib_keepalive.h"
 #include "tnfslib_stream.h"
 #include "compat_string.h"
 #include "../../include/debug.h"
 
-FileSystemTNFS fnTNFS;
+// Both are defined before fnTNFS: objects in one file are destroyed in reverse order, and
+// ~FileSystemTNFS uses them.
 
 // WSS mounts whose keep-alive is due, handed from the esp_timer task to the main loop.
 static tnfsKeepAliveQueue wss_keep_alives;
+
+#ifdef ESP_PLATFORM
+// Keep-alive timer callbacks reach a FileSystemTNFS only through this gate, which the
+// destructor closes (waiting for a callback in progress) before the object goes away.
+static tnfsCallbackGate keep_alive_gate;
+#endif
+
+FileSystemTNFS fnTNFS;
 
 // A failed "_wss." mount frees its connection and does not leave the protocol behind.
 static void release_wss(tnfsMountInfo &m_info)
@@ -41,21 +51,25 @@ FileSystemTNFS::FileSystemTNFS()
 
 FileSystemTNFS::~FileSystemTNFS()
 {
-    // First, so the main loop never services a mount that is going away (waits for a
-    // keep-alive in progress).
-    wss_keep_alives.remove(this);
-    if (_started)
-        tnfs_umount(&_mountinfo);
 #ifdef ESP_PLATFORM
-    if(_basepath[0] != '\0')
-    vfs_tnfs_unregister(_basepath);
-
+    // First, so no keep-alive runs during or after the unmount. Stopping the timer does not
+    // wait for a callback already running; closing the gate does.
     if (keepAliveTimerHandle != nullptr)
     {
         esp_timer_stop(keepAliveTimerHandle);
         esp_timer_delete(keepAliveTimerHandle);
         keepAliveTimerHandle = nullptr;
     }
+    keep_alive_gate.close(this);
+#endif
+    // The main loop never services a mount that is going away (waits for a WSS keep-alive
+    // in progress).
+    wss_keep_alives.remove(this);
+    if (_started)
+        tnfs_umount(&_mountinfo);
+#ifdef ESP_PLATFORM
+    if(_basepath[0] != '\0')
+    vfs_tnfs_unregister(_basepath);
 #endif
 }
 
@@ -147,7 +161,12 @@ success_is_true FileSystemTNFS::start(const char *host, uint16_t port, const cha
     // timer only marks them due.
     if (_mountinfo.protocol == TNFS_PROTOCOL_WS && !wss_keep_alives.add(this))
         Debug_println("TNFS WSS: no keep-alive slot, the session may expire when idle");
-    if (esp_timer_create(&tcfg, &keepAliveTimerHandle) == ESP_OK)
+    if (!keep_alive_gate.open(this))
+    {
+        keepAliveTimerHandle = nullptr;
+        Debug_printv("no TNFS keep-alive gate slot, sessions may expire when idle");
+    }
+    else if (esp_timer_create(&tcfg, &keepAliveTimerHandle) == ESP_OK)
         // Send a keep-alive message every 60s.
         esp_timer_start_periodic(keepAliveTimerHandle, 60 * 1000000);
     else
@@ -402,8 +421,10 @@ void keepAliveTNFS(void *info)
 #ifdef VERBOSE_TNFS
     Debug_println("Sending keep-alive command");
 #endif
-    FileSystemTNFS *parent = (FileSystemTNFS *)info;
-    parent->keep_alive();
+    // `info` is not dereferenced unless the object is still alive (see keep_alive_gate).
+    keep_alive_gate.run(info, [](void *client) {
+        static_cast<FileSystemTNFS *>(client)->keep_alive();
+    });
 }
 
 // Runs in the esp_timer task, whose 3.5 KB stack must not carry TLS or wait on the

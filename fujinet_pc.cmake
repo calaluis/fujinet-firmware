@@ -236,6 +236,7 @@ set(SOURCES src/main.cpp
     lib/TNFSlib/tnfslib_ws_transport.h lib/TNFSlib/tnfslib_ws_transport.cpp
     lib/TNFSlib/tnfslib_host.h lib/TNFSlib/tnfslib_host.cpp
     lib/TNFSlib/tnfslib_keepalive.h lib/TNFSlib/tnfslib_keepalive.cpp
+    lib/TNFSlib/tnfslib_callback_gate.h lib/TNFSlib/tnfslib_callback_gate.cpp
     lib/telnet/libtelnet.h lib/telnet/libtelnet.c
     lib/fnjson/fnjson.h lib/fnjson/fnjson.cpp
     lib/fnhtml/fnhtml.h lib/fnhtml/fnhtml.cpp

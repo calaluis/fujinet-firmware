@@ -576,6 +576,24 @@ target_link_libraries(tnfs_keepalive_tests PRIVATE Threads::Threads)
 add_test(NAME tnfs_keepalive_tests COMMAND tnfs_keepalive_tests)
 
 # ------------------------------------------------------------------------------
+# Keep-alive timer callback lifetime (lib/TNFSlib/tnfslib_callback_gate.cpp, U3).
+# ------------------------------------------------------------------------------
+add_executable(tnfs_callback_gate_tests
+    TnfsCallbackGateTests.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_callback_gate.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_keepalive.cpp
+)
+
+target_include_directories(tnfs_callback_gate_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/
+    ${CMAKE_SOURCE_DIR}/components_pc/   # doctest
+)
+
+target_link_libraries(tnfs_callback_gate_tests PRIVATE Threads::Threads)
+
+add_test(NAME tnfs_callback_gate_tests COMMAND tnfs_callback_gate_tests)
+
+# ------------------------------------------------------------------------------
 # lib/stuffit: unsit is a host CLI over the library. The sample tests compare
 # it against unar and ndif2raw; they need -DSIT_SAMPLES_DIR / -DNDIF2RAW_DIR
 # (or the same environment variables) and are skipped otherwise.
