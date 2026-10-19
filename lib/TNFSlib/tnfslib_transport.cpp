@@ -26,10 +26,10 @@ using namespace std;
 // INTERNAL UTILITY FUNCTIONS
 // ------------------------------------------------
 
-// The stream rules applied to this mount's TCP connection and reply buffer.
+// The stream rules applied to this mount's stream connection and reply buffer.
 static tnfsStreamLink _tnfs_tcp_link(tnfsMountInfo *m_info)
 {
-    return tnfsStreamLink(m_info->tcp_stream, *m_info);
+    return tnfsStreamLink(m_info->stream(), *m_info);
 }
 
 /*
@@ -167,6 +167,7 @@ bool _tnfs_transaction(tnfsMountInfo *m_info, tnfsPacket &pkt, uint16_t payload_
         switch(_tnfs_send_recv(udp, m_info, reqPkt, payload_size, pkt))
         {
             case SUCCESS:
+            m_info->last_reply_ms = static_cast<uint32_t>(fnSystem.millis());
             return true;
 
             case RESET:

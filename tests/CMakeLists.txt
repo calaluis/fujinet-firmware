@@ -610,7 +610,9 @@ add_test(NAME tnfs_framing_tests COMMAND tnfs_framing_tests)
 
 # ------------------------------------------------------------------------------
 # TNFS over TCP: the real lib/TNFSlib transaction code over the scripted peer in
-# tnfs_harness/ (split, merged, late, malformed and cut-off replies; UDP unchanged).
+# tnfs_harness/ (split, merged, late, malformed and cut-off replies; UDP unchanged), and
+# the same code over WSS on the simulated esp_transport_ws (no TCP or UDP fallback), and
+# the WSS keep-alive over long simulated idle periods.
 # ------------------------------------------------------------------------------
 add_executable(tnfs_tcp_recv_tests
     TNFSTcpRecvTests.cpp
@@ -622,6 +624,10 @@ add_executable(tnfs_tcp_recv_tests
     ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_framing.cpp
     ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_stream_link.cpp
     ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_tcp_stream.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_ws_frames.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_ws_stream.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_wss.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_keep_alive.cpp
 )
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   target_sources(tnfs_tcp_recv_tests PRIVATE ${CMAKE_SOURCE_DIR}/lib/compat/strlcpy.c)
@@ -635,6 +641,7 @@ target_include_directories(tnfs_tcp_recv_tests BEFORE PRIVATE
     ${CMAKE_SOURCE_DIR}/components_pc/        # doctest
 )
 target_compile_definitions(tnfs_tcp_recv_tests PRIVATE UNIT_TESTS)
+target_link_libraries(tnfs_tcp_recv_tests PRIVATE Threads::Threads) # keep-alive vs. a busy mount
 
 add_test(NAME tnfs_tcp_recv_tests COMMAND tnfs_tcp_recv_tests)
 
@@ -682,6 +689,38 @@ target_include_directories(tnfs_format_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/components_pc/   # doctest
 )
 add_test(NAME tnfs_format_tests COMMAND tnfs_format_tests)
+
+# ------------------------------------------------------------------------------
+# TNFS over WSS, all but the ESP-IDF adapter: the WebSocket frame tracker and
+# stream (over tnfs_harness/harness_ws.h, a simulation of esp_transport_ws), the
+# tnfsw:// host slot parser and the certificate date check.
+# ------------------------------------------------------------------------------
+add_executable(tnfs_ws_tests
+    TNFSWsTests.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_ws_frames.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_ws_stream.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_wss.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_wss_url.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_cert_time.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_stream_link.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_framing.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslibMountInfo.cpp
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/tnfslib_tcp_stream.cpp
+)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  target_sources(tnfs_ws_tests PRIVATE ${CMAKE_SOURCE_DIR}/lib/compat/strlcpy.c)
+endif()
+
+target_include_directories(tnfs_ws_tests BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/tests/tnfs_harness/
+    ${CMAKE_SOURCE_DIR}/lib/TNFSlib/
+    ${CMAKE_SOURCE_DIR}/lib/compat/
+    ${CMAKE_SOURCE_DIR}/include/
+    ${CMAKE_SOURCE_DIR}/components_pc/        # doctest
+)
+target_compile_definitions(tnfs_ws_tests PRIVATE UNIT_TESTS)
+
+add_test(NAME tnfs_ws_tests COMMAND tnfs_ws_tests)
 
 # ------------------------------------------------------------------------------
 # The N: TCP protocol (lib/network-protocol/TCP.cpp) over the fake socket in

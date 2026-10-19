@@ -2,6 +2,9 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <thread>
+#include <chrono>
+#include <atomic>
 #include <cstdio>
 #include <cstdint>
 #include <functional>
@@ -15,6 +18,10 @@
 #include "harness_server.h"
 #include "tnfslib.h"
 #include "tnfslib_framing.h"
+#include "tnfslib_keep_alive.h"
+#include "tnfslib_wss.h"
+
+#include "harness_ws.h"
 #include "tnfslib_internal.h" // _tnfs_transaction, for probe_format()
 
 // The real TNFS client (lib/TNFSlib) over the stand-ins in tests/tnfs_harness/.
@@ -1346,4 +1353,702 @@ TEST_CASE("TCP fence: a fence whose write fails says nothing about the server")
     CHECK(s.server.fences == 1);
     CHECK(s.info.tcp_reply_format.stat_strings == tnfsFieldUse::ABSENT);
     CHECK(harness_server.tcp_connects == 2);
+}
+
+// ------------------------------------------------------------------------------------------
+// TNFS over WSS: the same transaction code, configured as fnFsTNFS::use_wss() does, over a
+// tnfsWsStream on the simulated esp_transport_ws in harness_ws.h.
+
+namespace
+{
+// run_session() for a mount that is not a Session.
+void run_wss_session(tnfsMountInfo &info)
+{
+    REQUIRE(tnfs_mount(&info) == TNFS_RESULT_SUCCESS);
+    CHECK(info.session == 0xBEEF);
+    CHECK(stat_size(info) == FILE_SIZE);
+    check_file(info);
+    check_dir(info);
+}
+
+struct WssSession
+{
+    FakeTNFSd server;
+    harness_ws::Net net;
+    harness_ws::WsLog log;
+    tnfsMountInfo info{"stnfs.example"};
+    // Each reply as the bridge sends it: one binary frame, by default.
+    std::function<void(const Bytes &reply)> frames = [this](const Bytes &r)
+    { net.push(harness_ws::frame(harness_ws::T::OP_BINARY, r)); };
+
+    WssSession()
+    {
+        harness_server = HarnessServer();
+        harness_server.on_request = [](const Bytes &) { FAIL("TCP or UDP socket used"); };
+        fnSystem.now_us = 0;
+        server.transmit = [this](const Bytes &r) { frames(r); };
+        log.on_request = [this](const Bytes &r) { server.handle(r); };
+
+        void *memory = tnfs_stream_transport_memory(sizeof(tnfsWsStream));
+        REQUIRE(memory != nullptr);
+        info.stream_transport.reset(new (memory) tnfsWsStream(
+            std::unique_ptr<tnfsWsIo>(new harness_ws::SimIo(net, log))));
+        info.host_ip = IPADDR_NONE;
+        info.port = 443;
+        info.protocol = TNFS_PROTOCOL_TCP;
+        info.timeout_ms = TNFS_WSS_TIMEOUT;
+        info.max_retries = TNFS_WSS_RETRIES;
+    }
+
+    void check_no_socket() const
+    {
+        CHECK(harness_server.tcp_connects == 0);
+        CHECK(harness_server.udp_requests == 0);
+        CHECK(info.protocol == TNFS_PROTOCOL_TCP);
+    }
+};
+} // namespace
+
+TEST_CASE("WSS: a whole session over one WebSocket, and no TCP or UDP socket")
+{
+    WssSession s;
+    run_wss_session(s.info);
+    s.check_no_socket();
+    CHECK(s.log.connects == 1);
+    // Every request, and the fences that settled the STAT strings and the READ count: the format
+    // is identified over WSS exactly as over TCP.
+    CHECK(s.server.fences == 2);
+    CHECK(s.log.frames_sent == static_cast<int>(s.server.commands.size()) + s.server.fences);
+    // The mount's budget reaches the connect.
+    CHECK(s.log.open_timeouts == std::vector<int>{tnfsWsStream::CONNECT_TIMEOUT_MS});
+    CHECK(s.info.tcp_stream.is_open() == false);
+}
+
+TEST_CASE("WSS: paumaed's optional fields are identified over the WebSocket as over TCP")
+{
+    // Its STAT strings and failed READ counts in their own frames: the fences settle both, the
+    // data is whole, and nothing goes out on a TCP or UDP socket.
+    WssSession s;
+    s.server.stat_strings = s.server.error_count = true;
+    s.server.uid_string = "fntest";
+    s.server.gid_string = "users";
+    s.frames = [&s](const Bytes &r)
+    {
+        size_t cut = r[3] == TNFS_CMD_STAT && r[4] == TNFS_RESULT_SUCCESS ? 27 : r.size();
+        s.net.push(harness_ws::frame(harness_ws::T::OP_BINARY, slice(r, 0, cut)));
+        if (cut < r.size())
+            s.net.push(harness_ws::frame(harness_ws::T::OP_BINARY, slice(r, cut)));
+    };
+    run_wss_session(s.info);
+    mount_image(s.info);
+    s.check_no_socket();
+    CHECK(s.info.tcp_reply_format.stat_strings == tnfsFieldUse::PRESENT);
+    CHECK(s.info.tcp_reply_format.read_count == tnfsFieldUse::PRESENT);
+    CHECK(s.server.fences == 2);
+    CHECK(s.log.connects == 1);
+    CHECK(s.server.count(TNFS_CMD_MOUNT) == 1);
+}
+
+TEST_CASE("WSS: replies cut into small, fragmented frames with pings between them")
+{
+    for (size_t size : {1, 5, 64, 200})
+    {
+        CAPTURE(size);
+        WssSession s;
+        // The host build of the receive loop waits 7 ms per poll and a poll reads one frame, so
+        // a 500-byte reply in 1-byte frames takes ~3.5 s of virtual time: longer than the 2 s
+        // reply wait. That case checks the framing with the longer budget; the others run with
+        // the mount's own. (On ESP32 the loop only yields between polls.)
+        if (size == 1)
+            s.info.timeout_ms = 5000;
+        s.frames = [&s, size](const Bytes &r)
+        {
+            for (size_t pos = 0; pos < r.size(); pos += size)
+            {
+                bool first = pos == 0, last = pos + size >= r.size();
+                s.net.push(harness_ws::frame(first ? harness_ws::T::OP_BINARY
+                                                   : harness_ws::T::OP_CONTINUATION,
+                                             slice(r, pos, pos + size), last));
+                if (pos % 3 == 0)
+                    s.net.push(harness_ws::frame(harness_ws::T::OP_PING, {1}));
+            }
+        };
+        run_wss_session(s.info);
+        s.check_no_socket();
+        CHECK(s.log.connects == 1);
+        CHECK(!s.log.pongs.empty());
+    }
+}
+
+TEST_CASE("WSS: two replies in one frame")
+{
+    WssSession s;
+    REQUIRE(tnfs_mount(&s.info) == TNFS_RESULT_SUCCESS);
+    // The STAT reply arrives together with a stale duplicate of the MOUNT reply in front.
+    Bytes stale = {0xEF, 0xBE, static_cast<uint8_t>(s.info.current_sequence_num - 1),
+                   TNFS_CMD_MOUNT, TNFS_RESULT_SUCCESS, 0x02, 0x01, 0x64, 0x00};
+    s.frames = [&s, stale](const Bytes &r)
+    { s.net.push(harness_ws::frame(harness_ws::T::OP_BINARY, concat(stale, r))); };
+    CHECK(stat_size(s.info) == FILE_SIZE);
+    s.check_no_socket();
+}
+
+TEST_CASE("WSS: an unreachable server fails the request; no fallback to TCP or UDP")
+{
+    WssSession s;
+    s.log.fail_open = true;
+    CHECK(tnfs_mount(&s.info) != TNFS_RESULT_SUCCESS);
+    s.check_no_socket();
+    CHECK(s.log.connects == TNFS_WSS_RETRIES); // one connect per attempt, then give up
+    CHECK(s.log.frames_sent == 0);
+    CHECK(s.info.tcp_replies == nullptr);
+}
+
+TEST_CASE("WSS: a silent server is given up on within the retry budget; no fallback")
+{
+    WssSession s;
+    s.log.on_request = [](const Bytes &) {}; // the bridge accepts, TNFSD never answers
+    CHECK(tnfs_mount(&s.info) != TNFS_RESULT_SUCCESS);
+    s.check_no_socket();
+    CHECK(s.log.frames_sent == TNFS_WSS_RETRIES);
+    CHECK(s.log.connects == 1); // nothing buffered, so the connection is kept for the retry
+    uint64_t budget_ms = uint64_t(TNFS_WSS_RETRIES) * (TNFS_WSS_TIMEOUT + s.info.min_retry_ms + 100);
+    CHECK(fnSystem.millis() <= budget_ms);
+}
+
+TEST_CASE("WSS: the server closes mid-reply; the retry reconnects and completes")
+{
+    WssSession s;
+    REQUIRE(tnfs_mount(&s.info) == TNFS_RESULT_SUCCESS);
+    auto pending = std::make_shared<bool>(true);
+    s.frames = [&s, pending](const Bytes &r)
+    {
+        if (*pending && r[3] == TNFS_CMD_STAT)
+        {
+            *pending = false;
+            s.net.push(harness_ws::frame(harness_ws::T::OP_BINARY, slice(r, 0, 10)));
+            s.net.push(harness_ws::frame(harness_ws::T::OP_CLOSE, {0x03, 0xE8}));
+            return;
+        }
+        s.net.push(harness_ws::frame(harness_ws::T::OP_BINARY, r));
+    };
+    CHECK(stat_size(s.info) == FILE_SIZE);
+    s.check_no_socket();
+    CHECK(s.log.connects == 2);
+    CHECK(s.log.close_frames == 1);
+}
+
+TEST_CASE("WSS: a lost frame mid-reply never completes the retry's reply")
+{
+    WssSession s;
+    REQUIRE(tnfs_mount(&s.info) == TNFS_RESULT_SUCCESS);
+    auto pending = std::make_shared<bool>(true);
+    s.frames = [&s, pending](const Bytes &r)
+    {
+        Bytes f = harness_ws::frame(harness_ws::T::OP_BINARY, r);
+        if (*pending && r[3] == TNFS_CMD_STAT)
+        {
+            *pending = false;
+            s.net.push(slice(f, 0, 12)); // the payload stalls: ESP-IDF forgets the frame
+            s.net.stall();
+            s.net.push(slice(f, 12, f.size()));
+            return;
+        }
+        s.net.push(f);
+    };
+    CHECK(stat_size(s.info) == FILE_SIZE);
+    s.check_no_socket();
+    CHECK(s.log.connects == 2);
+}
+
+// ------------------------------------------------------------------------------------------
+// The tnfsw:// keep-alive (tnfslib_keep_alive.cpp) over long idle periods on the virtual clock,
+// against a server that expires idle sessions as TNFSD does and a proxy that closes idle
+// WebSockets.
+
+namespace
+{
+constexpr uint64_t SESSION_TIMEOUT_MS = 600000; // TNFSD drops a session idle this long
+
+// WssSession whose server expires idle sessions (and their open handles) and whose bridge
+// may close idle WebSockets.
+struct IdleWssSession : WssSession
+{
+    uint64_t last_request = 0;  // server side, any request
+    uint64_t last_traffic = 0;  // bridge side, any frame either way
+    uint64_t idle_close_ms = 0; // 0: the bridge never closes an idle WebSocket
+    bool expired = false;
+    bool handles_lost = false;
+    bool server_down = false; // the bridge answers every request with CLOSE
+    int mounts = 0, keep_alives = 0, bad_handles = 0, bridge_closes = 0;
+    int connection = 0; // log.connects as last seen by the bridge
+
+    IdleWssSession()
+    {
+        log.on_request = [this](const Bytes &r) { request(r); };
+        frames = [this](const Bytes &r)
+        {
+            last_traffic = fnSystem.millis();
+            net.push(harness_ws::frame(harness_ws::T::OP_BINARY, r));
+        };
+    }
+
+    void request(const Bytes &r)
+    {
+        uint64_t now = fnSystem.millis();
+        if (log.connects != connection) // a new WebSocket: its idle time starts now
+        {
+            connection = log.connects;
+            last_traffic = now;
+        }
+        if (server_down || (idle_close_ms && now - last_traffic >= idle_close_ms))
+        {
+            // The bridge closed this WebSocket; the request never reaches TNFSD.
+            bridge_closes++;
+            net.push(harness_ws::frame(harness_ws::T::OP_CLOSE, {0x03, 0xE9}));
+            return;
+        }
+        last_traffic = now;
+        uint8_t command = r[3];
+        if (mounts > 0 && now - last_request >= SESSION_TIMEOUT_MS)
+        {
+            expired = true;
+            handles_lost = true;
+        }
+        last_request = now;
+        if (command == TNFS_CMD_MOUNT)
+        {
+            mounts++;
+            expired = false;
+        }
+        else if (expired)
+        {
+            server.commands.push_back(command);
+            frames({0xEF, 0xBE, r[2], command, TNFS_RESULT_INVALID_HANDLE});
+            return;
+        }
+        static const char KEEP_ALIVE_PATH[] = "/keep-alive";
+        if (command == TNFS_CMD_STAT && r.size() >= 4 + sizeof(KEEP_ALIVE_PATH) &&
+            std::equal(KEEP_ALIVE_PATH, KEEP_ALIVE_PATH + sizeof(KEEP_ALIVE_PATH), r.begin() + 4))
+            keep_alives++;
+        if (command == TNFS_CMD_OPEN)
+            handles_lost = false;
+        if (command == TNFS_CMD_READ && handles_lost)
+        {
+            bad_handles++;
+            server.commands.push_back(command);
+            frames({0xEF, 0xBE, r[2], command, TNFS_RESULT_BAD_FILENUM});
+            return;
+        }
+        server.handle(r);
+    }
+
+    // `ms` of idle time, with the main loop calling service() every 10 ms of it.
+    void idle(tnfsKeepAliveRegistry *keep_alive, uint64_t ms)
+    {
+        uint64_t end = fnSystem.millis() + ms;
+        while (fnSystem.millis() < end)
+        {
+            fnSystem.delay(10);
+            if (keep_alive)
+                keep_alive->service(static_cast<uint32_t>(fnSystem.millis()));
+        }
+    }
+};
+
+struct OpenImage
+{
+    int16_t handle = -1;
+    uint32_t pos = 0;
+    // Read `n` bytes and check them; the TNFS result of the last read. Reads within the
+    // TNFS_FILE_CACHE_SIZE bytes cached by the last one never reach the server.
+    int read(tnfsMountInfo &info, uint32_t n)
+    {
+        uint8_t buf[100];
+        while (n > 0)
+        {
+            uint16_t got = 0;
+            int r = tnfs_read(&info, handle, buf, std::min<uint32_t>(n, sizeof(buf)), &got);
+            if (r != TNFS_RESULT_SUCCESS)
+                return r;
+            for (uint16_t i = 0; i < got; i++)
+                if (buf[i] != file_byte(pos + i))
+                    return -100;
+            pos += got;
+            n -= got;
+        }
+        return TNFS_RESULT_SUCCESS;
+    }
+};
+
+// Wait in real time for another thread, but never hang a broken build: false after `ms`.
+bool wait_for(const std::atomic<bool> &flag, int ms = 5000)
+{
+    auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (!flag && std::chrono::steady_clock::now() < end)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return flag;
+}
+
+OpenImage open_image(IdleWssSession &s)
+{
+    OpenImage img;
+    REQUIRE(tnfs_mount(&s.info) == TNFS_RESULT_SUCCESS);
+    REQUIRE(tnfs_open(&s.info, "/game.atr", TNFS_OPENMODE_READ, 0, &img.handle) ==
+            TNFS_RESULT_SUCCESS);
+    REQUIRE(img.read(s.info, 100) == TNFS_RESULT_SUCCESS);
+    return img;
+}
+} // namespace
+
+namespace
+{
+tnfsWsStream &ws_of(WssSession &s) { return *static_cast<tnfsWsStream *>(s.info.stream_transport.get()); }
+
+success_is_true register_mount(tnfsKeepAliveRegistry &r, WssSession &s)
+{ return r.add(&s.info, &ws_of(s), static_cast<uint32_t>(fnSystem.millis())); }
+
+// Virtual time spent in one service() call.
+uint64_t timed_service(tnfsKeepAliveRegistry &r)
+{
+    uint64_t t0 = fnSystem.millis();
+    r.service(static_cast<uint32_t>(fnSystem.millis()));
+    return fnSystem.millis() - t0;
+}
+
+// Longest single service() call while idling `ms`, servicing every 10 ms.
+uint64_t idle_worst(tnfsKeepAliveRegistry &r, uint64_t ms)
+{
+    uint64_t worst = 0, end = fnSystem.millis() + ms;
+    while (fnSystem.millis() < end)
+    {
+        fnSystem.delay(10);
+        worst = std::max(worst, timed_service(r));
+    }
+    return worst;
+}
+
+// The longest a keep-alive may take on the virtual clock: one request written, one 1.5 s reply
+// wait (polled in 7 ms steps here), no retry delay.
+constexpr uint64_t ONE_KEEP_ALIVE_MS = TNFS_KEEP_ALIVE_TIMEOUT_MS + 50;
+} // namespace
+
+TEST_CASE("WSS keep-alive: an open disk image still reads after 30 idle minutes")
+{
+    IdleWssSession s;
+    tnfsKeepAliveRegistry keep_alive;
+    OpenImage img = open_image(s);
+    REQUIRE(register_mount(keep_alive, s).is_success());
+    s.idle(&keep_alive, 30 * 60 * 1000);
+    CHECK(s.keep_alives >= 29); // one per 60 s tick
+    CHECK(s.keep_alives <= 30);
+    CHECK(img.read(s.info, 600) == TNFS_RESULT_SUCCESS);
+    CHECK(s.mounts == 1); // the session never expired
+    CHECK(s.bad_handles == 0);
+    CHECK(s.log.connects == 1);
+    s.check_no_socket();
+}
+
+TEST_CASE("WSS keep-alive: without it the session expires and the open image is lost")
+{
+    // The failure the keep-alive exists for, on the same fixture.
+    IdleWssSession s;
+    OpenImage img = open_image(s);
+    s.idle(nullptr, 30 * 60 * 1000);
+    // Session recovery remounts, but a READ needs the handle the old session had: the
+    // client gives up on it without asking the server again (_tnfs_session_recovery).
+    CHECK(img.read(s.info, 600) == TNFS_RESULT_BAD_FILENUM);
+    CHECK(s.mounts == 2);
+    CHECK(s.keep_alives == 0);
+}
+
+TEST_CASE("WSS keep-alive: a tick within 30 s of a reply is skipped")
+{
+    IdleWssSession s;
+    tnfsKeepAliveRegistry keep_alive;
+    OpenImage img = open_image(s);
+    REQUIRE(register_mount(keep_alive, s).is_success());
+    int stats = s.server.count(TNFS_CMD_STAT);
+    for (int i = 0; i < 30; i++) // a request every 20 s for 10 minutes
+    {
+        s.idle(&keep_alive, 20000);
+        REQUIRE(stat_size(s.info) == FILE_SIZE);
+    }
+    CHECK(s.keep_alives == 0);
+    CHECK(s.server.count(TNFS_CMD_STAT) == stats + 30); // only the computer's own
+    CHECK(img.read(s.info, 600) == TNFS_RESULT_SUCCESS);
+
+    // The rule itself, at its edge.
+    uint32_t last = s.info.last_reply_ms;
+    CHECK(tnfs_keep_alive(&s.info, ws_of(s), last + TNFS_KEEP_ALIVE_RECENT_MS - 1) ==
+          tnfsKeepAliveResult::RECENT);
+    CHECK(tnfs_keep_alive(&s.info, ws_of(s), last + TNFS_KEEP_ALIVE_RECENT_MS) ==
+          tnfsKeepAliveResult::SENT);
+    CHECK(s.keep_alives == 1);
+}
+
+TEST_CASE("WSS keep-alive: the cadence is a 60 s tick per mount")
+{
+    IdleWssSession s;
+    tnfsKeepAliveRegistry keep_alive;
+    open_image(s);
+    REQUIRE(register_mount(keep_alive, s).is_success());
+    s.idle(&keep_alive, TNFS_KEEP_ALIVE_PERIOD_MS - 2000);
+    CHECK(s.keep_alives == 0); // the first tick is a period after registration
+    s.idle(&keep_alive, 3000);
+    CHECK(s.keep_alives == 1);
+    s.idle(&keep_alive, TNFS_KEEP_ALIVE_PERIOD_MS - 2000);
+    CHECK(s.keep_alives == 1);
+    s.idle(&keep_alive, 3000);
+    CHECK(s.keep_alives == 2);
+}
+
+TEST_CASE("WSS keep-alive: a closed WebSocket is never reopened (no DNS, TCP or TLS)")
+{
+    IdleWssSession s;
+    tnfsKeepAliveRegistry keep_alive;
+    OpenImage img = open_image(s);
+    REQUIRE(register_mount(keep_alive, s).is_success());
+    ws_of(s).close(); // the connection went away
+    s.info.tcp_replies.reset();
+    REQUIRE(s.log.connects == 1);
+    s.idle(&keep_alive, 5 * 60 * 1000);
+    CHECK(s.log.connects == 1); // SimIo::open() is the DNS + TCP + TLS + upgrade on ESP32
+    CHECK(s.keep_alives == 0);
+    CHECK(tnfs_keep_alive(&s.info, ws_of(s), static_cast<uint32_t>(fnSystem.millis())) ==
+          tnfsKeepAliveResult::CLOSED);
+    // The next real operation reconnects as before, and the session is still there.
+    CHECK(img.read(s.info, 600) == TNFS_RESULT_SUCCESS);
+    CHECK(s.log.connects == 2);
+}
+
+TEST_CASE("WSS keep-alive: a WebSocket the proxy closed is not reconnected")
+{
+    SUBCASE("the proxy closes after 45 s: the keep-alive finds it closed, then leaves it")
+    {
+        IdleWssSession s;
+        s.idle_close_ms = 45000;
+        tnfsKeepAliveRegistry keep_alive;
+        OpenImage img = open_image(s);
+        REQUIRE(register_mount(keep_alive, s).is_success());
+        s.idle(&keep_alive, 30 * 60 * 1000);
+        CHECK(s.bridge_closes == 1); // the first tick's request met the closed bridge
+        CHECK(s.log.connects == 1);  // and nothing reconnected
+        CHECK(s.keep_alives == 0);
+        // The session expired while nothing could reach the server,
+        // so the next real operation reconnects and recovers the session, not the open file.
+        CHECK(img.read(s.info, 600) == TNFS_RESULT_BAD_FILENUM);
+    }
+    SUBCASE("the proxy closes after 100 s: the keep-alive keeps the WebSocket open")
+    {
+        IdleWssSession s;
+        s.idle_close_ms = 100000;
+        tnfsKeepAliveRegistry keep_alive;
+        OpenImage img = open_image(s);
+        REQUIRE(register_mount(keep_alive, s).is_success());
+        s.idle(&keep_alive, 20 * 60 * 1000);
+        CHECK(s.bridge_closes == 0);
+        CHECK(s.log.connects == 1);
+        CHECK(img.read(s.info, 600) == TNFS_RESULT_SUCCESS);
+    }
+}
+
+TEST_CASE("WSS keep-alive: a silent server costs one bounded request per tick, never more")
+{
+    IdleWssSession s;
+    tnfsKeepAliveRegistry keep_alive;
+    OpenImage img = open_image(s);
+    REQUIRE(register_mount(keep_alive, s).is_success());
+    int sent_before = s.log.frames_sent;
+    s.log.on_request = [](const Bytes &) {}; // the bridge is up, TNFSD does not answer
+    uint64_t worst = idle_worst(keep_alive, 5 * 60 * 1000);
+    int attempts = s.log.frames_sent - sent_before;
+    CHECK(attempts >= 4); // every tick tried again: no suspension
+    CHECK(attempts <= 5); // and only one request per tick
+    CHECK(worst <= ONE_KEEP_ALIVE_MS);
+    CHECK(s.log.connects == 1);
+    CHECK(s.info.max_retries == TNFS_WSS_RETRIES);
+    CHECK(s.info.timeout_ms == TNFS_WSS_TIMEOUT);
+
+    // The server answers again: the next tick's keep-alive succeeds without any help.
+    s.log.on_request = [&s](const Bytes &r) { s.request(r); };
+    int keep_alives = s.keep_alives;
+    s.idle(&keep_alive, 2 * 60 * 1000);
+    CHECK(s.keep_alives >= keep_alives + 1);
+    CHECK(img.read(s.info, 600) == TNFS_RESULT_SUCCESS);
+    CHECK(s.log.connects == 1);
+}
+
+TEST_CASE("WSS keep-alive: a session recovery inside a keep-alive never reconnects")
+{
+    IdleWssSession s;
+    open_image(s);
+    // The server answers the keep-alive with "invalid session" and closes the WebSocket: the
+    // recovery's MOUNT finds no connection, and must not open one.
+    s.log.on_request = [&s](const Bytes &r)
+    {
+        if (r[3] == TNFS_CMD_STAT)
+        {
+            s.frames({0xEF, 0xBE, r[2], r[3], TNFS_RESULT_INVALID_HANDLE});
+            s.net.push(harness_ws::frame(harness_ws::T::OP_CLOSE, {0x03, 0xE8}));
+            return;
+        }
+        s.request(r);
+    };
+    uint16_t retry_delay = s.info.min_retry_ms;
+    uint64_t t0 = fnSystem.millis();
+    tnfs_keep_alive(&s.info, ws_of(s), s.info.last_reply_ms + TNFS_KEEP_ALIVE_PERIOD_MS);
+    CHECK(fnSystem.millis() - t0 <= 2 * ONE_KEEP_ALIVE_MS);
+    CHECK(s.log.connects == 1);
+    CHECK(s.info.min_retry_ms == retry_delay);
+    // Connecting is allowed again for real operations.
+    s.log.on_request = [&s](const Bytes &r) { s.request(r); };
+    CHECK(stat_size(s.info) == FILE_SIZE);
+    CHECK(s.log.connects == 2);
+}
+
+TEST_CASE("WSS keep-alive: several silent mounts never add up in one pass, and none starves")
+{
+    constexpr int N = 9; // eight host slots and the boot mount
+    std::vector<std::unique_ptr<IdleWssSession>> ss;
+    for (int i = 0; i < N; i++)
+        ss.emplace_back(new IdleWssSession);
+    tnfsKeepAliveRegistry keep_alive;
+    std::vector<int> sent_before;
+    for (auto &s : ss)
+    {
+        open_image(*s);
+        REQUIRE(register_mount(keep_alive, *s).is_success());
+        s->log.on_request = [](const Bytes &) {};
+        sent_before.push_back(s->log.frames_sent);
+    }
+    uint64_t worst = idle_worst(keep_alive, 10 * 60 * 1000);
+    CHECK(worst <= ONE_KEEP_ALIVE_MS); // one request per pass, whatever the number of mounts
+    for (int i = 0; i < N; i++)
+    {
+        CAPTURE(i);
+        int attempts = ss[i]->log.frames_sent - sent_before[i];
+        CHECK(attempts >= 9); // every mount, every period
+        CHECK(attempts <= 10);
+        CHECK(ss[i]->log.connects == 1);
+    }
+}
+
+TEST_CASE("WSS keep-alive: several healthy mounts all stay alive")
+{
+    constexpr int N = 9;
+    std::vector<std::unique_ptr<IdleWssSession>> ss;
+    for (int i = 0; i < N; i++)
+        ss.emplace_back(new IdleWssSession);
+    tnfsKeepAliveRegistry keep_alive;
+    std::vector<OpenImage> imgs;
+    for (auto &s : ss)
+    {
+        imgs.push_back(open_image(*s));
+        REQUIRE(register_mount(keep_alive, *s).is_success());
+    }
+    idle_worst(keep_alive, 30 * 60 * 1000);
+    for (int i = 0; i < N; i++)
+    {
+        CAPTURE(i);
+        CHECK(ss[i]->keep_alives >= 28);
+        CHECK(imgs[i].read(ss[i]->info, 600) == TNFS_RESULT_SUCCESS);
+        CHECK(ss[i]->mounts == 1);
+    }
+}
+
+TEST_CASE("WSS keep-alive: a mount in a transaction on another task is skipped, not waited for")
+{
+    IdleWssSession s;
+    open_image(s);
+    std::atomic<bool> held{false}, release{false};
+    std::thread other([&] {
+        std::lock_guard<std::recursive_mutex> lock(s.info.transaction_mutex);
+        held = true;
+        wait_for(release, 2000); // a keep-alive that waits for the lock is released after 2 s
+    });
+    REQUIRE(wait_for(held));
+    uint32_t now = s.info.last_reply_ms + TNFS_KEEP_ALIVE_PERIOD_MS;
+    auto t0 = std::chrono::steady_clock::now();
+    CHECK(tnfs_keep_alive(&s.info, ws_of(s), now) == tnfsKeepAliveResult::BUSY);
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(100));
+    release = true;
+    other.join();
+    CHECK(s.keep_alives == 0);
+    CHECK(tnfs_keep_alive(&s.info, ws_of(s), now) == tnfsKeepAliveResult::SENT);
+    CHECK(s.keep_alives == 1);
+}
+
+TEST_CASE("WSS keep-alive registry: membership and capacity")
+{
+    harness_ws::Net net;
+    harness_ws::WsLog log;
+    std::vector<std::unique_ptr<tnfsMountInfo>> mounts;
+    std::vector<std::unique_ptr<tnfsWsStream>> streams;
+    for (int i = 0; i <= tnfsKeepAliveRegistry::CAPACITY; i++)
+    {
+        mounts.emplace_back(new tnfsMountInfo("h"));
+        streams.emplace_back(new tnfsWsStream(std::unique_ptr<tnfsWsIo>(new harness_ws::SimIo(net, log))));
+    }
+    tnfsKeepAliveRegistry r;
+    for (int i = 0; i < tnfsKeepAliveRegistry::CAPACITY; i++)
+        REQUIRE(r.add(mounts[i].get(), streams[i].get(), 0).is_success());
+    CHECK(r.add(mounts[0].get(), streams[0].get(), 0).is_error()); // already there
+    CHECK(r.add(mounts[tnfsKeepAliveRegistry::CAPACITY].get(),
+                streams[tnfsKeepAliveRegistry::CAPACITY].get(), 0).is_error()); // full
+    r.remove(mounts[3].get());
+    CHECK(r.registered() == tnfsKeepAliveRegistry::CAPACITY - 1);
+    CHECK(r.add(mounts[tnfsKeepAliveRegistry::CAPACITY].get(), nullptr, 0).is_error()); // no stream
+    CHECK(r.add(mounts[tnfsKeepAliveRegistry::CAPACITY].get(),
+                streams[tnfsKeepAliveRegistry::CAPACITY].get(), 0).is_success());
+}
+
+TEST_CASE("WSS keep-alive registry: removed mounts are left alone; ticks survive the millis wrap")
+{
+    IdleWssSession s;
+    open_image(s);
+    tnfsKeepAliveRegistry r;
+    // Registered just before millis() wraps: the first tick falls after the wrap.
+    uint32_t start = 0xFFFFFFFFu - 10000;
+    REQUIRE(r.add(&s.info, &ws_of(s), start).is_success());
+    s.info.last_reply_ms = start;
+    CHECK(r.service(start + 1000) == 0);
+    CHECK(r.service(start + TNFS_KEEP_ALIVE_PERIOD_MS) == 1); // wrapped, and due
+    CHECK(s.keep_alives == 1);
+    r.remove(&s.info);
+    CHECK(r.service(start + 10 * TNFS_KEEP_ALIVE_PERIOD_MS) == 0);
+    CHECK(s.keep_alives == 1);
+}
+
+TEST_CASE("WSS keep-alive registry: remove() waits only for the one keep-alive in progress")
+{
+    IdleWssSession s;
+    open_image(s);
+    tnfsKeepAliveRegistry r;
+    REQUIRE(register_mount(r, s).is_success());
+    std::atomic<bool> in_request{false}, release{false}, removed{false};
+    s.log.on_request = [&](const Bytes &req) {
+        in_request = true;
+        wait_for(release);
+        s.request(req);
+    };
+    uint32_t due = static_cast<uint32_t>(fnSystem.millis()) + TNFS_KEEP_ALIVE_PERIOD_MS;
+    std::thread loop([&] { r.service(due); });
+    if (!wait_for(in_request))
+    {
+        loop.join();
+        FAIL("the keep-alive never started");
+    }
+    std::thread destroyer([&] {
+        r.remove(&s.info);
+        removed = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK_FALSE(removed); // still inside the keep-alive
+    release = true;
+    loop.join();
+    destroyer.join();
+    CHECK(removed);
+    CHECK(r.registered() == 0);
+    CHECK(s.keep_alives == 1);
 }

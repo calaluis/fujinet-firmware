@@ -83,6 +83,8 @@ public:
         void start_sntp_client();
         void stop_sntp_client();
         void set_sntp_lastsync();
+        // millis() at the last SNTP time sync; 0 if the clock has not been synced since boot.
+        unsigned long get_sntp_lastsync() const { return _sntp_last_sync; }
     };
     _net Net;
 

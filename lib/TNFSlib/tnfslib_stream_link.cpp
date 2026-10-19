@@ -56,7 +56,7 @@ success_is_true tnfsStreamLink::send(const tnfsPacket &request, size_t len)
 {
     if (!_transport.is_open())
     {
-        if (_transport.open(_mount.hostname, _mount.host_ip, _mount.port, TNFS_TIMEOUT).is_error())
+        if (_transport.open(_mount.hostname, _mount.host_ip, _mount.port, _mount.timeout_ms).is_error())
         {
             Debug_println("Can't connect to the TNFS server");
             RETURN_ERROR_AS_FALSE();
