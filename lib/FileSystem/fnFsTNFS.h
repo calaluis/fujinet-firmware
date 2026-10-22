@@ -3,14 +3,18 @@
 
 #include "fnFS.h"
 #include "tnfslib.h"
+#include "tnfslib_wss_url.h"
 #ifdef ESP_PLATFORM
 #include <esp_timer.h>
 #endif /* ESP_PLATFORM */
+
+class tnfsWsStream;
 
 class FileSystemTNFS : public FileSystem
 {
 private:
     tnfsMountInfo _mountinfo;
+    tnfsWsStream *_wss = nullptr; // the transport of a tnfsw:// mount, owned by _mountinfo
 #ifdef ESP_PLATFORM
     unsigned long _last_dns_refresh  = 0;
     esp_timer_handle_t keepAliveTimerHandle = nullptr;
@@ -18,6 +22,13 @@ private:
     uint64_t _last_dns_refresh  = 0;
 #endif
     char _current_dirpath[TNFS_MAX_FILELEN];
+
+    success_is_true use_host(const char *host, uint16_t port);
+    success_is_true use_wss(const tnfsWssUrl &url);
+    void release_stream();
+#ifdef ESP_PLATFORM
+    void start_keep_alive();
+#endif
 
 public:
     FileSystemTNFS();
@@ -34,6 +45,8 @@ public:
 #endif
 
     bool is_started();
+    // Keep-alives for tnfsw:// mounts; call often from the main loop.
+    static void service_keep_alives();
     bool exists(const char* path) override;
 
     success_is_true remove(const char* path) override;

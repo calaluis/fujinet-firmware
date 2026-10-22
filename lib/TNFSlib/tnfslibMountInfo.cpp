@@ -11,17 +11,17 @@
 #include "PSRAMAllocator.h"
 
 // PSRAM first; the default heap when there is no PSRAM, or none left.
-static void *allocate_replies() { return PSRAMAllocator<tnfsReplyAssembler>().allocate(1); }
-static void free_replies(tnfsReplyAssembler *replies)
-{ PSRAMAllocator<tnfsReplyAssembler>().deallocate(replies, 1); }
+static void *allocate_psram(size_t size) { return PSRAMAllocator<uint8_t>().allocate(size); }
+static void free_psram(void *memory)
+{ PSRAMAllocator<uint8_t>().deallocate(static_cast<uint8_t *>(memory), 0); }
 #else
-static void *allocate_replies() { return std::malloc(sizeof(tnfsReplyAssembler)); }
-static void free_replies(tnfsReplyAssembler *replies) { std::free(replies); }
+static void *allocate_psram(size_t size) { return std::malloc(size); }
+static void free_psram(void *memory) { std::free(memory); }
 #endif
 
 tnfsReplyAssemblerPtr tnfs_new_reply_assembler()
 {
-    void *memory = allocate_replies();
+    void *memory = allocate_psram(sizeof(tnfsReplyAssembler));
     if (memory == nullptr)
         return nullptr;
     return tnfsReplyAssemblerPtr(new (memory) tnfsReplyAssembler);
@@ -30,7 +30,15 @@ tnfsReplyAssemblerPtr tnfs_new_reply_assembler()
 void tnfsReplyAssemblerDeleter::operator()(tnfsReplyAssembler *replies) const
 {
     replies->~tnfsReplyAssembler();
-    free_replies(replies);
+    free_psram(replies);
+}
+
+void *tnfs_stream_transport_memory(size_t size) { return allocate_psram(size); }
+
+void tnfsStreamTransportDeleter::operator()(tnfsStreamTransport *transport) const
+{
+    transport->~tnfsStreamTransport();
+    free_psram(transport);
 }
 
 tnfsMountInfo::tnfsMountInfo() = default;

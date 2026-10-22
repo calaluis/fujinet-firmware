@@ -1,6 +1,7 @@
 #ifndef _TNFSLIB_MOUNTINFO_H
 #define _TNFSLIB_MOUNTINFO_H
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -84,6 +85,16 @@ using tnfsReplyAssemblerPtr = std::unique_ptr<tnfsReplyAssembler, tnfsReplyAssem
 // An empty tnfsReplyAssembler, in PSRAM when there is any; nullptr when out of memory.
 tnfsReplyAssemblerPtr tnfs_new_reply_assembler();
 
+// Frees a transport built with placement new in tnfs_stream_transport_memory().
+struct tnfsStreamTransportDeleter
+{
+    void operator()(tnfsStreamTransport *transport) const;
+};
+using tnfsStreamTransportPtr = std::unique_ptr<tnfsStreamTransport, tnfsStreamTransportDeleter>;
+
+// Memory for a transport, in PSRAM when there is any; nullptr when out of memory.
+void *tnfs_stream_transport_memory(size_t size);
+
 // Some things we need to keep track of for every file we open
 struct tnfsFileHandleInfo
 {
@@ -145,7 +156,10 @@ public:
 
     uint8_t protocol = TNFS_PROTOCOL_UNKNOWN;
     tnfsTcpStream tcp_stream;
-    // Replies read from tcp_stream and not yet taken; allocated on connect, freed on drop.
+    // Replaces tcp_stream for a mount that talks through another byte stream (TNFS over WSS).
+    tnfsStreamTransportPtr stream_transport;
+    tnfsStreamTransport &stream() { return stream_transport ? *stream_transport : tcp_stream; }
+    // Replies read from stream() and not yet taken; allocated on connect, freed on drop.
     tnfsReplyAssemblerPtr tcp_replies;
     // Learned per field; kept across reconnects, forgotten by tnfs_umount().
     tnfsReplyFormat tcp_reply_format;
@@ -167,6 +181,9 @@ public:
     uint8_t max_retries = TNFS_RETRIES;
     int timeout_ms = TNFS_TIMEOUT;
     uint8_t current_sequence_num = 0; // Updated with each transaction to the server
+    // fnSystem.millis() (truncated) when a transaction last got its reply; read by the
+    // keep-alive in another task.
+    std::atomic<uint32_t> last_reply_ms{0};
 
     int16_t dir_handle = TNFS_INVALID_HANDLE; // Stored from server's response to TNFS_OPENDIR
     uint16_t dir_entries = 0; // Stored from server's response to TNFS_OPENDIRX

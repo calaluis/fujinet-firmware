@@ -33,6 +33,7 @@
 
 #include "fsFlash.h"
 #include "fnFsSD.h"
+#include "fnFsTNFS.h"
 
 #include "fnLedStrip.h"
 
@@ -607,6 +608,9 @@ void fn_service_loop(void *param)
 #endif
 
 #ifdef ESP_PLATFORM
+        // tnfsw:// keep-alives: network I/O that may reconnect belongs here, not in esp_timer.
+        FileSystemTNFS::service_keep_alives();
+
         taskYIELD(); // Allow other tasks to run
 #else
 // !ESP_PLATFORM

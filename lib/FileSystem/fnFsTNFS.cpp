@@ -14,8 +14,15 @@
 #include "fnSystem.h"
 #include "fnDNS.h"
 #include "tnfslib.h"
+#include "tnfslib_keep_alive.h"
+#include "tnfslib_ws_stream.h"
+#include "tnfslib_wss.h"
 #include "compat_string.h"
 #include "../../include/debug.h"
+
+// tnfsw:// mounts, kept alive from the main loop because the esp_timer task's stack cannot
+// hold TLS. Defined before fnTNFS so it outlives fnTNFS's destructor.
+static tnfsKeepAliveRegistry wss_keep_alives;
 
 FileSystemTNFS fnTNFS;
 
@@ -26,6 +33,8 @@ FileSystemTNFS::FileSystemTNFS()
 
 FileSystemTNFS::~FileSystemTNFS()
 {
+    // First: waits for a keep-alive the main loop may be running on this mount.
+    wss_keep_alives.remove(&_mountinfo);
     if (_started)
         tnfs_umount(&_mountinfo);
 #ifdef ESP_PLATFORM
@@ -49,6 +58,102 @@ success_is_true FileSystemTNFS::start(const char *host, uint16_t port, const cha
     if(host == nullptr)
         RETURN_ERROR_AS_FALSE();
 
+    // tnfsw:// selects TNFS over a secure WebSocket and nothing else: a URL that cannot be used
+    // fails the mount instead of falling back to TCP or UDP.
+    tnfsWssUrl wss;
+    tnfsWssUrlResult wss_url = tnfs_parse_wss_url(host, wss);
+    if (wss_url == tnfsWssUrlResult::INVALID)
+    {
+        Debug_printf("Invalid TNFS over WSS host \"%s\"\r\n", host);
+        RETURN_ERROR_AS_FALSE();
+    }
+    bool wss_mount = wss_url == tnfsWssUrlResult::VALID;
+    if ((wss_mount ? use_wss(wss) : use_host(host, port)).is_error())
+        RETURN_ERROR_AS_FALSE();
+    _mountinfo.session = TNFS_INVALID_SESSION;
+
+    if(mountpath != nullptr)
+        strlcpy(_mountinfo.mountpath, mountpath, sizeof(_mountinfo.mountpath));
+    else
+        _mountinfo.mountpath[0] = '\0';
+
+    if(userid != nullptr)
+        strlcpy(_mountinfo.user, userid, sizeof(_mountinfo.user));
+    else
+        _mountinfo.user[0] = '\0';
+
+    if(password != nullptr)
+        strlcpy(_mountinfo.password, password, sizeof(_mountinfo.password));
+    else
+        _mountinfo.password[0] = '\0';
+
+    Debug_printf("TNFS mount %s[%s]:%hu\r\n", _mountinfo.hostname, compat_inet_ntoa(_mountinfo.host_ip), _mountinfo.port);
+
+    int r = tnfs_mount(&_mountinfo);
+    if (r != TNFS_RESULT_SUCCESS)
+    {
+        Debug_printf("TNFS mount failed with code %d\r\n", r);
+        _mountinfo.mountpath[0] = '\0';
+        _started = false;
+        release_stream();
+        RETURN_ERROR_AS_FALSE();
+    }
+    Debug_printf("TNFS mount successful. session: 0x%hx, version: 0x%04hx, min_retry: %hums\r\n", _mountinfo.session, _mountinfo.server_version, _mountinfo.min_retry_ms);
+
+#ifdef ESP_PLATFORM
+    // Register a new VFS driver to handle this connection
+    if(vfs_tnfs_register(_mountinfo, _basepath, sizeof(_basepath)) != 0)
+    {
+        Debug_println("Failed to register VFS driver!");
+        // Release the server session opened by tnfs_mount above.
+        tnfs_umount(&_mountinfo);
+        _mountinfo.session = TNFS_INVALID_SESSION;
+        _basepath[0] = '\0';
+        release_stream();
+        RETURN_ERROR_AS_FALSE();
+    }
+
+    // The esp_timer keep-alive runs a TNFS transaction on the timer task, whose small stack
+    // cannot hold a TLS session; a tnfsw:// mount is kept alive from the main loop instead.
+    if (!wss_mount)
+        start_keep_alive();
+    else if (wss_keep_alives.add(&_mountinfo, _wss, static_cast<uint32_t>(fnSystem.millis())).is_error())
+        Debug_printv("no room for a TNFS keep-alive, the session may expire when idle");
+#endif
+
+    _started = true;
+
+    RETURN_SUCCESS_AS_TRUE();
+}
+
+void FileSystemTNFS::service_keep_alives()
+{
+    wss_keep_alives.service(static_cast<uint32_t>(fnSystem.millis()));
+}
+
+#ifdef ESP_PLATFORM
+void FileSystemTNFS::start_keep_alive()
+{
+    esp_timer_create_args_t tcfg = {
+        .callback = keepAliveTNFS,
+        .arg = this,
+        .dispatch_method = esp_timer_dispatch_t::ESP_TIMER_TASK,
+        .name = "tnfs_keep_alive",
+        .skip_unhandled_events = true,
+    };
+    if (esp_timer_create(&tcfg, &keepAliveTimerHandle) == ESP_OK)
+        // Send a keep-alive message every 60s.
+        esp_timer_start_periodic(keepAliveTimerHandle, 60 * 1000000);
+    else
+    {
+        keepAliveTimerHandle = nullptr;
+        Debug_printv("could not create TNFS keep-alive timer, sessions may expire when idle");
+    }
+}
+#endif
+
+success_is_true FileSystemTNFS::use_host(const char *host, uint16_t port)
+{
     const char *host_no_prefix;
     if (strncmp("_tcp.", host, 5) == 0)
     {
@@ -81,67 +186,43 @@ success_is_true FileSystemTNFS::start(const char *host, uint16_t port, const cha
     _last_dns_refresh = fnSystem.millis();
 
     _mountinfo.port = port;
-    _mountinfo.session = TNFS_INVALID_SESSION;
-
-    if(mountpath != nullptr)
-        strlcpy(_mountinfo.mountpath, mountpath, sizeof(_mountinfo.mountpath));
-    else
-        _mountinfo.mountpath[0] = '\0';
-
-    if(userid != nullptr)
-        strlcpy(_mountinfo.user, userid, sizeof(_mountinfo.user));
-    else
-        _mountinfo.user[0] = '\0';
-
-    if(password != nullptr)
-        strlcpy(_mountinfo.password, password, sizeof(_mountinfo.password));
-    else
-        _mountinfo.password[0] = '\0';
-
-    Debug_printf("TNFS mount %s[%s]:%hu\r\n", _mountinfo.hostname, compat_inet_ntoa(_mountinfo.host_ip), _mountinfo.port);
-
-    int r = tnfs_mount(&_mountinfo);
-    if (r != TNFS_RESULT_SUCCESS)
-    {
-        Debug_printf("TNFS mount failed with code %d\r\n", r);
-        _mountinfo.mountpath[0] = '\0';
-        _started = false;
-        RETURN_ERROR_AS_FALSE();
-    }
-    Debug_printf("TNFS mount successful. session: 0x%hx, version: 0x%04hx, min_retry: %hums\r\n", _mountinfo.session, _mountinfo.server_version, _mountinfo.min_retry_ms);
-
-#ifdef ESP_PLATFORM
-    // Register a new VFS driver to handle this connection
-    if(vfs_tnfs_register(_mountinfo, _basepath, sizeof(_basepath)) != 0)
-    {
-        Debug_println("Failed to register VFS driver!");
-        // Release the server session opened by tnfs_mount above.
-        tnfs_umount(&_mountinfo);
-        _mountinfo.session = TNFS_INVALID_SESSION;
-        _basepath[0] = '\0';
-        RETURN_ERROR_AS_FALSE();
-    }
-
-    esp_timer_create_args_t tcfg = {
-        .callback = keepAliveTNFS,
-        .arg = this,
-        .dispatch_method = esp_timer_dispatch_t::ESP_TIMER_TASK,
-        .name = "tnfs_keep_alive",
-        .skip_unhandled_events = true,
-    };
-    if (esp_timer_create(&tcfg, &keepAliveTimerHandle) == ESP_OK)
-        // Send a keep-alive message every 60s.
-        esp_timer_start_periodic(keepAliveTimerHandle, 60 * 1000000);
-    else
-    {
-        keepAliveTimerHandle = nullptr;
-        Debug_printv("could not create TNFS keep-alive timer, sessions may expire when idle");
-    }
-#endif
-
-    _started = true;
-
     RETURN_SUCCESS_AS_TRUE();
+}
+
+success_is_true FileSystemTNFS::use_wss(const tnfsWssUrl &url)
+{
+    tnfsStreamTransportPtr stream = tnfs_new_wss_stream(url.path);
+    if (!stream)
+    {
+        Debug_println("TNFS over WSS is not available");
+        RETURN_ERROR_AS_FALSE();
+    }
+    strlcpy(_mountinfo.hostname, url.host, sizeof(_mountinfo.hostname));
+    // No lookup here: the WSS connection resolves the name itself, and needs it for SNI and
+    // for the certificate check.
+    _mountinfo.host_ip = IPADDR_NONE;
+    _mountinfo.port = url.port;
+    // Stream framing over the WSS transport; a forced protocol also rules out the UDP fallback.
+    _mountinfo.protocol = TNFS_PROTOCOL_TCP;
+    _mountinfo.timeout_ms = TNFS_WSS_TIMEOUT;
+    _mountinfo.max_retries = TNFS_WSS_RETRIES;
+    // tnfs_new_wss_stream() only ever makes a tnfsWsStream; the keep-alive needs that type.
+    _wss = static_cast<tnfsWsStream *>(stream.get());
+    _mountinfo.stream_transport = std::move(stream);
+    RETURN_SUCCESS_AS_TRUE();
+}
+
+// A failed tnfsw:// mount leaves no transport, protocol or budget behind on this object.
+void FileSystemTNFS::release_stream()
+{
+    if (!_mountinfo.stream_transport)
+        return;
+    _wss = nullptr;
+    _mountinfo.stream_transport.reset();
+    _mountinfo.tcp_replies.reset();
+    _mountinfo.protocol = TNFS_PROTOCOL_UNKNOWN;
+    _mountinfo.timeout_ms = TNFS_TIMEOUT;
+    _mountinfo.max_retries = TNFS_RETRIES;
 }
 
 bool FileSystemTNFS::is_started()
